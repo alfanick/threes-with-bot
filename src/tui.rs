@@ -10,8 +10,13 @@ use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use std::io::{stdout, IsTerminal, Stdout, Write};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
+use std::thread;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TILE_WIDTH: usize = 8;
 const TILE_HEIGHT: usize = 4;
@@ -79,10 +84,124 @@ struct BotOpponentState {
     active: bool,
 }
 
+struct BotOpponent {
+    game: Game,
+    state: BotOpponentState,
+    thinker: OpponentThinker,
+}
+
+struct OpponentThinker {
+    request_tx: Option<mpsc::Sender<OpponentThinkRequest>>,
+    pending: Option<PendingThought>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct OpponentThinkRequest {
+    game: Game,
+    time_limit_ms: Option<u64>,
+    cancel: Arc<AtomicBool>,
+    response: mpsc::Sender<Option<Direction>>,
+}
+
+struct PendingThought {
+    cancel: Arc<AtomicBool>,
+    response: mpsc::Receiver<Option<Direction>>,
+}
+
+impl OpponentThinker {
+    fn new(kind: BotKind, seed: u64) -> Self {
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || opponent_think_worker(kind, seed, request_rx));
+        Self {
+            request_tx: Some(request_tx),
+            pending: None,
+            handle: Some(handle),
+        }
+    }
+
+    fn request_move(&mut self, game: &Game, time_limit_ms: Option<u64>) {
+        if let Some(pending) = self.pending.take() {
+            pending.cancel.store(true, Ordering::SeqCst);
+        }
+
+        let (response_tx, response_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let Some(request_tx) = self.request_tx.as_ref() else {
+            return;
+        };
+        if request_tx
+            .send(OpponentThinkRequest {
+                game: game.clone(),
+                time_limit_ms,
+                cancel: cancel.clone(),
+                response: response_tx,
+            })
+            .is_err()
+        {
+            self.pending = None;
+            return;
+        }
+
+        self.pending = Some(PendingThought {
+            cancel,
+            response: response_rx,
+        });
+    }
+
+    fn request_if_needed(&mut self, enabled: bool, game: &Game, time_limit_ms: Option<u64>) {
+        if enabled {
+            self.request_move(game, time_limit_ms);
+        } else {
+            self.cancel_pending();
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn cancel_and_take_move(&mut self) -> Option<Direction> {
+        let pending = self.pending.take()?;
+        pending.cancel.store(true, Ordering::SeqCst);
+        pending.response.recv().ok().flatten()
+    }
+
+    fn take_move(&mut self) -> Option<Direction> {
+        let pending = self.pending.take()?;
+        pending.response.recv().ok().flatten()
+    }
+}
+
+impl Drop for OpponentThinker {
+    fn drop(&mut self) {
+        self.cancel_pending();
+        self.request_tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn opponent_think_worker(
+    kind: BotKind,
+    seed: u64,
+    request_rx: mpsc::Receiver<OpponentThinkRequest>,
+) {
+    let mut bot = create_bot(kind, seed);
+    while let Ok(request) = request_rx.recv() {
+        bot.set_cancel_token(Some(request.cancel));
+        bot.set_time_limit_ms(request.time_limit_ms);
+        let direction = bot.choose_move(&request.game);
+        let _ = request.response.send(direction);
+    }
+}
+
 fn step_bot_opponent_turn(
-    bot: &mut dyn Bot,
     opponent_game: &mut Game,
     opponent_state: &mut BotOpponentState,
+    direction: Option<Direction>,
     visible_next: Option<&NextTile>,
     forced_rank: Option<u16>,
     mirror_human_next: bool,
@@ -95,7 +214,8 @@ fn step_bot_opponent_turn(
     if let Some(visible_next) = visible_next {
         opponent_game.force_next_tile(visible_next.clone());
     }
-    match bot.choose_move(opponent_game) {
+
+    match direction {
         Some(bot_direction) => {
             let opponent_result = match forced_rank {
                 Some(rank) => opponent_game.step_with_forced_next(bot_direction, rank),
@@ -144,6 +264,26 @@ fn redraw_human_state(
     }
 }
 
+fn human_move_budget_ms(elapsed: Duration) -> u64 {
+    let millis = elapsed.as_millis();
+    if millis == 0 {
+        return 1;
+    }
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn opponent_view(
+    opponent: &Option<BotOpponent>,
+) -> Option<(&Game, Option<&LastMoveView>, Option<&NextTile>)> {
+    opponent.as_ref().map(|opponent| {
+        (
+            &opponent.game,
+            opponent.state.last_move.as_ref(),
+            Some(opponent.game.next_tile()),
+        )
+    })
+}
+
 pub fn run_human(config: HumanConfig) -> Result<()> {
     let mut stdout = stdout();
     let use_color = match config.color {
@@ -155,15 +295,13 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
     let mut logger = GameLogger::new(config.log_json.clone(), config.log_text.clone())?;
     let mut seed = next_seed(config.seed);
     let mut game = Game::new(seed);
-    let mut bot_opponent = config.bot_opponent.map(|kind| {
-        (
-            create_bot(kind, seed),
-            Game::new(seed),
-            BotOpponentState {
-                last_move: None,
-                active: true,
-            },
-        )
+    let mut bot_opponent = config.bot_opponent.map(|kind| BotOpponent {
+        game: Game::new(seed),
+        state: BotOpponentState {
+            last_move: None,
+            active: true,
+        },
+        thinker: OpponentThinker::new(kind, seed),
     });
     let log_config = RunConfigLog {
         mode: "human".to_string(),
@@ -180,26 +318,29 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
     let _guard = TerminalGuard::activate(&mut stdout)?;
     logger.log_start(&game.snapshot(), &log_config)?;
     let mut last_move = None;
+    let mut opponent_turn_time_limit_ms = None;
+
     redraw_human_state(
         &mut stdout,
         &game,
         last_move.as_ref(),
         use_color,
         "arrows, wasd/hjkl to move; q quit; r restart",
-        bot_opponent
-            .as_ref()
-            .map(|(_, opponent_game, opponent_state)| {
-                (
-                    opponent_game,
-                    opponent_state.last_move.as_ref(),
-                    Some(opponent_game.next_tile()),
-                )
-            }),
+        opponent_view(&bot_opponent),
     )?;
 
+    if let Some(opponent) = bot_opponent.as_mut() {
+        opponent
+            .thinker
+            .request_move(&opponent.game, opponent_turn_time_limit_ms);
+    }
+
     loop {
+        let turn_started = Instant::now();
         match read_action()? {
             Action::Move(direction) => {
+                let elapsed = turn_started.elapsed();
+                let human_budget_ms = human_move_budget_ms(elapsed);
                 let result = game.step(direction);
                 logger.log_turn(&result)?;
                 if let Some(spawn) = result.spawn.as_ref() {
@@ -210,19 +351,28 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                 }
 
                 if result.accepted {
+                    opponent_turn_time_limit_ms = Some(human_budget_ms);
                     let forced_rank = result.spawn.as_ref().map_or_else(
                         || game.next_tile().single_rank().unwrap_or(3),
                         |spawn| spawn.rank,
                     );
-                    if let Some((bot, opponent_game, opponent_state)) = bot_opponent.as_mut() {
+                    if let Some(opponent) = bot_opponent.as_mut() {
+                        let direction = opponent.thinker.cancel_and_take_move();
                         step_bot_opponent_turn(
-                            bot.as_mut(),
-                            opponent_game,
-                            opponent_state,
+                            &mut opponent.game,
+                            &mut opponent.state,
+                            direction,
                             Some(game.next_tile()),
                             Some(forced_rank),
                             true,
                         );
+                        if opponent.state.active {
+                            opponent.thinker.request_if_needed(
+                                opponent.state.active,
+                                &opponent.game,
+                                opponent_turn_time_limit_ms,
+                            );
+                        }
                     }
                 }
 
@@ -237,42 +387,46 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     &redraw_message,
-                    bot_opponent
-                        .as_ref()
-                        .map(|(_, opponent_game, opponent_state)| {
-                            (
-                                opponent_game,
-                                opponent_state.last_move.as_ref(),
-                                Some(opponent_game.next_tile()),
-                            )
-                        }),
+                    opponent_view(&bot_opponent),
                 )?;
 
                 if result.game_over {
-                    if let Some((bot, opponent_game, opponent_state)) = bot_opponent.as_mut() {
-                        while step_bot_opponent_turn(
-                            bot.as_mut(),
-                            opponent_game,
-                            opponent_state,
-                            None,
-                            None,
-                            false,
-                        ) {
-                            redraw_human_state(
-                                &mut stdout,
-                                &game,
-                                last_move.as_ref(),
-                                use_color,
-                                "human finished, bot continues",
-                                Some((
-                                    opponent_game,
-                                    opponent_state.last_move.as_ref(),
-                                    Some(opponent_game.next_tile()),
-                                )),
-                            )?;
-                            sleep(Duration::from_secs_f64(1.0 / config.speed_hz));
+                    if let Some(opponent) = bot_opponent.as_mut() {
+                        while opponent.state.active && !opponent.game.is_game_over() {
+                            let bot_next = opponent.game.next_tile().clone();
+                            opponent.thinker.request_if_needed(
+                                true,
+                                &opponent.game,
+                                Some(human_budget_ms),
+                            );
+                            let direction = opponent.thinker.take_move();
+                            step_bot_opponent_turn(
+                                &mut opponent.game,
+                                &mut opponent.state,
+                                direction,
+                                Some(&bot_next),
+                                None,
+                                false,
+                            );
+                            if opponent.state.active && !opponent.game.is_game_over() {
+                                let bot_next = opponent.game.next_tile();
+                                redraw_human_state(
+                                    &mut stdout,
+                                    &game,
+                                    last_move.as_ref(),
+                                    use_color,
+                                    "human finished, bot continues",
+                                    Some((
+                                        &opponent.game,
+                                        opponent.state.last_move.as_ref(),
+                                        Some(bot_next),
+                                    )),
+                                )?;
+                                sleep(Duration::from_secs_f64(1.0 / config.speed_hz));
+                            }
                         }
 
+                        let bot_next = opponent.game.next_tile();
                         redraw_human_state(
                             &mut stdout,
                             &game,
@@ -280,9 +434,9 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                             use_color,
                             &redraw_message,
                             Some((
-                                opponent_game,
-                                opponent_state.last_move.as_ref(),
-                                Some(opponent_game.next_tile()),
+                                &opponent.game,
+                                opponent.state.last_move.as_ref(),
+                                Some(bot_next),
                             )),
                         )?;
                     }
@@ -298,15 +452,7 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     "Quit? y/n",
-                    bot_opponent
-                        .as_ref()
-                        .map(|(_, opponent_game, opponent_state)| {
-                            (
-                                opponent_game,
-                                opponent_state.last_move.as_ref(),
-                                Some(opponent_game.next_tile()),
-                            )
-                        }),
+                    opponent_view(&bot_opponent),
                 )? {
                     logger.log_end("quit", &game.snapshot())?;
                     break;
@@ -317,15 +463,7 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     "arrows, wasd/hjkl to move; q quit; r restart",
-                    bot_opponent
-                        .as_ref()
-                        .map(|(_, opponent_game, opponent_state)| {
-                            (
-                                opponent_game,
-                                opponent_state.last_move.as_ref(),
-                                Some(opponent_game.next_tile()),
-                            )
-                        }),
+                    opponent_view(&bot_opponent),
                 )?;
             }
             Action::Restart => {
@@ -335,29 +473,25 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     "Restart? y/n",
-                    bot_opponent
-                        .as_ref()
-                        .map(|(_, opponent_game, opponent_state)| {
-                            (
-                                opponent_game,
-                                opponent_state.last_move.as_ref(),
-                                Some(opponent_game.next_tile()),
-                            )
-                        }),
+                    opponent_view(&bot_opponent),
                 )? {
                     logger.log_end("restart", &game.snapshot())?;
                     seed = next_seed(config.seed);
+                    opponent_turn_time_limit_ms = None;
                     game = Game::new(seed);
-                    bot_opponent = config.bot_opponent.map(|kind| {
-                        (
-                            create_bot(kind, seed),
-                            Game::new(seed),
-                            BotOpponentState {
-                                last_move: None,
-                                active: true,
-                            },
-                        )
+                    bot_opponent = config.bot_opponent.map(|kind| BotOpponent {
+                        game: Game::new(seed),
+                        state: BotOpponentState {
+                            last_move: None,
+                            active: true,
+                        },
+                        thinker: OpponentThinker::new(kind, seed),
                     });
+                    if let Some(opponent) = bot_opponent.as_mut() {
+                        opponent
+                            .thinker
+                            .request_move(&opponent.game, opponent_turn_time_limit_ms);
+                    }
                     last_move = None;
                     logger.log_start(&game.snapshot(), &log_config)?;
                 }
@@ -367,15 +501,7 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     "arrows, wasd/hjkl to move; q quit; r restart",
-                    bot_opponent
-                        .as_ref()
-                        .map(|(_, opponent_game, opponent_state)| {
-                            (
-                                opponent_game,
-                                opponent_state.last_move.as_ref(),
-                                Some(opponent_game.next_tile()),
-                            )
-                        }),
+                    opponent_view(&bot_opponent),
                 )?;
             }
             Action::Terminate => {
@@ -1127,7 +1253,8 @@ mod tests {
             active: true,
         };
         let mut bot = StaticBot(direction);
-        step_bot_opponent_turn(&mut bot, &mut opponent_game, &mut state, None, None, false);
+        let direction = bot.choose_move(&opponent_game);
+        step_bot_opponent_turn(&mut opponent_game, &mut state, direction, None, None, false);
 
         assert_eq!(
             opponent_game.next_tile().display_label(),

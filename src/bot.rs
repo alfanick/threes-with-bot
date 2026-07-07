@@ -6,6 +6,10 @@ use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 const BOT_SEED_DOMAIN: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -35,6 +39,8 @@ pub trait Bot {
     fn search_stats(&self) -> Option<AbSearchStats> {
         None
     }
+    fn set_time_limit_ms(&mut self, _time_limit_ms: Option<u64>) {}
+    fn set_cancel_token(&mut self, _cancel: Option<Arc<AtomicBool>>) {}
 
     fn board_eval(&self, _game: &Game) -> Option<f64> {
         None
@@ -121,6 +127,7 @@ struct AbBot {
     config: AbConfig,
     cache: RwLock<HashMap<AbCacheKey, AbCacheEntry>>,
     last_stats: Option<AbSearchStats>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl AbBot {
@@ -129,6 +136,7 @@ impl AbBot {
             config,
             cache: RwLock::new(HashMap::new()),
             last_stats: None,
+            cancel: None,
         }
     }
 
@@ -167,7 +175,7 @@ impl AbBot {
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|(index, direction)| {
-                let mut budget = SearchBudget::unlimited();
+                let mut budget = SearchBudget::unlimited_with_cancel(self.cancel.clone());
                 let value = self.expected_value_for_move(
                     game,
                     direction,
@@ -224,7 +232,11 @@ impl AbBot {
         ordered_directions: &[Direction],
         board_eval: f64,
     ) -> Option<(Direction, f64, AbSearchStats)> {
-        let mut budget = SearchBudget::new(self.config.search_time_limit(), self.config.node_limit);
+        let mut budget = SearchBudget::with_cancel(
+            self.config.search_time_limit(),
+            self.config.node_limit,
+            self.cancel.clone(),
+        );
 
         let mut best: Option<(Direction, f64)> = None;
         let mut alpha = self.config.alpha;
@@ -359,7 +371,7 @@ impl AbBot {
 
     #[cfg(test)]
     fn search(&self, game: &Game, depth: u8, alpha: f64, beta: f64) -> f64 {
-        let mut budget = SearchBudget::unlimited();
+        let mut budget = SearchBudget::unlimited_with_cancel(self.cancel.clone());
         self.search_with_budget(game, depth, alpha, beta, &mut budget)
     }
 
@@ -573,6 +585,7 @@ struct MoveCandidate {
 #[derive(Debug)]
 struct SearchBudget {
     deadline: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
     node_limit: Option<u64>,
     nodes: u64,
     pruned_states: u64,
@@ -581,10 +594,20 @@ struct SearchBudget {
 }
 
 impl SearchBudget {
+    #[allow(dead_code)]
     fn new(deadline: Option<Duration>, node_limit: Option<u64>) -> Self {
+        Self::with_cancel(deadline, node_limit, None)
+    }
+
+    fn with_cancel(
+        deadline: Option<Duration>,
+        node_limit: Option<u64>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let deadline = deadline.map(|duration| Instant::now() + duration);
         Self {
             deadline,
+            cancel,
             node_limit,
             nodes: 0,
             pruned_states: 0,
@@ -593,18 +616,22 @@ impl SearchBudget {
         }
     }
 
+    #[allow(dead_code)]
     fn unlimited() -> Self {
-        Self {
-            deadline: None,
-            node_limit: None,
-            nodes: 0,
-            pruned_states: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-        }
+        Self::new(None, None)
+    }
+
+    fn unlimited_with_cancel(cancel: Option<Arc<AtomicBool>>) -> Self {
+        Self::with_cancel(None, None, cancel)
     }
 
     fn can_continue(&self) -> bool {
+        if let Some(cancel) = &self.cancel {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+        }
+
         if let Some(limit) = self.node_limit {
             if self.nodes >= limit {
                 return false;
@@ -680,6 +707,14 @@ impl Bot for AbBot {
 
     fn board_eval(&self, game: &Game) -> Option<f64> {
         Some(evaluate(game, self.config))
+    }
+
+    fn set_time_limit_ms(&mut self, time_limit_ms: Option<u64>) {
+        self.config.time_limit_ms = time_limit_ms;
+    }
+
+    fn set_cancel_token(&mut self, cancel: Option<Arc<AtomicBool>>) {
+        self.cancel = cancel;
     }
 }
 

@@ -119,8 +119,8 @@ fn main() -> Result<()> {
 
     match command {
         Command::Play => {
+            let ab_config = ab_config(&cli)?;
             if let Some(bot) = cli.bot {
-                let ab_config = ab_config(&cli)?;
                 run_observed_bot(BotConfig {
                     seed: cli.seed,
                     log_json: cli.log_json,
@@ -130,8 +130,12 @@ fn main() -> Result<()> {
                     bot: bot.to_kind(ab_config),
                 })
             } else {
+                let mut opponent_ab_config = ab_config;
                 let bot_opponent = if let Some(bot) = cli.bot_opponent {
-                    Some(bot.to_kind(ab_config(&cli)?))
+                    if let BotName::Ab = bot {
+                        opponent_ab_config.time_limit_ms = None;
+                    }
+                    Some(bot.to_kind(opponent_ab_config))
                 } else {
                     None
                 };
