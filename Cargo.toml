@@ -1,9 +1,10 @@
 [package]
 name = "threes-with-bot"
-version = "0.1.0"
+version = "0.1.1"
 description = "Terminal Threes clone with human play, bot opponent support, and alpha-beta bot evaluation"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/alfanick/threes-with-bot"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Threes Contributors"]
