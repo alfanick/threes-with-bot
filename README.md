@@ -1,6 +1,6 @@
-# Threes
+# Threes with Bot
 
-`threes` is a terminal implementation of the 2048-style tile game with rules
+# `threes-with-bot` is a terminal implementation of the 2048-style tile game with rules
 matching [Threes!](https://threesgame.com): merging `1` and `2` into `3`, then
 equal powers of two combine onward.
 
@@ -17,7 +17,7 @@ equal powers of two combine onward.
 ## Install and Run
 
 ```bash
-cargo run --release -- play
+cargo run --release --manifest-path Cargo.toml -- play
 ```
 
 ## Examples
@@ -25,19 +25,25 @@ cargo run --release -- play
 ### Human mode
 
 ```bash
-cargo run --release -- --speed 6
+cargo run --release --manifest-path Cargo.toml -- --speed 6
 ```
 
 ### Observed bot mode
 
 ```bash
-cargo run --release -- --bot ab --ab-depth 4
+cargo run --release --manifest-path Cargo.toml -- --bot ab --ab-depth 4
 ```
 
 ### Human mode with bot opponent
 
 ```bash
-cargo run --release -- --bot-opponent ab --ab-depth 3
+cargo run --release --manifest-path Cargo.toml -- --bot-opponent ab --ab-depth 3
+```
+
+After installing:
+
+```bash
+threes-with-bot --help
 ```
 
 ## Controls

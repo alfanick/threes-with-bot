@@ -1,11 +1,17 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-use threes::bot::{AbConfig, BotKind};
-use threes::tui::{run_human, run_observed_bot, BotConfig, ColorMode as TuiColorMode, HumanConfig};
+use threes_with_bot::bot::{AbConfig, BotKind};
+use threes_with_bot::tui::{
+    run_human, run_observed_bot, BotConfig, ColorMode as TuiColorMode, HumanConfig,
+};
 
 #[derive(Parser, Debug)]
-#[command(name = "threes", version, about = "A terminal Threes implementation")]
+#[command(
+    name = "threes-with-bot",
+    version,
+    about = "A terminal Threes implementation"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -60,7 +66,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        default_value_t = 3,
+        default_value_t = 5,
         help = "Search depth for --bot ab"
     )]
     ab_depth: u8,

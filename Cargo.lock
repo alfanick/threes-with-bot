@@ -551,7 +551,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "threes"
+name = "threes-with-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
