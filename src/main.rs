@@ -51,6 +51,15 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        value_enum,
+        value_name = "BOT",
+        help = "Enable bot opponent board in human mode"
+    )]
+    bot_opponent: Option<BotName>,
+
+    #[arg(
+        long,
+        global = true,
         default_value_t = 3,
         help = "Search depth for --bot ab"
     )]
@@ -121,12 +130,18 @@ fn main() -> Result<()> {
                     bot: bot.to_kind(ab_config),
                 })
             } else {
+                let bot_opponent = if let Some(bot) = cli.bot_opponent {
+                    Some(bot.to_kind(ab_config(&cli)?))
+                } else {
+                    None
+                };
                 run_human(HumanConfig {
                     seed: cli.seed,
                     log_json: cli.log_json,
                     log_text: cli.log_text,
                     color: cli.color.into(),
                     speed_hz: cli.speed,
+                    bot_opponent,
                 })
             }
         }

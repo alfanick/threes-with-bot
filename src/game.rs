@@ -27,10 +27,22 @@ pub enum NextTile {
 }
 
 impl NextTile {
+    pub fn single_rank(&self) -> Option<u16> {
+        match self {
+            Self::Basic { rank, .. } => Some(*rank),
+            Self::Bonus { ranks, .. } if ranks.len() == 1 => ranks.first().copied(),
+            _ => None,
+        }
+    }
+
     pub fn display_label(&self) -> String {
         match self {
             Self::Basic { face, .. } => face.to_string(),
             Self::Bonus { faces, .. } => {
+                if faces.len() == 1 {
+                    return faces[0].to_string();
+                }
+
                 let labels = faces.iter().map(u64::to_string).collect::<Vec<_>>();
                 format!("+ {}", labels.join("/"))
             }
@@ -188,6 +200,10 @@ impl Game {
         &self.next_tile
     }
 
+    pub fn force_next_tile(&mut self, next_tile: NextTile) {
+        self.next_tile = next_tile;
+    }
+
     pub fn bonus_forecast(&self, horizon: u8) -> BonusForecast {
         self.bonus_tracker.forecast(horizon)
     }
@@ -278,6 +294,14 @@ impl Game {
     }
 
     pub fn step(&mut self, direction: Direction) -> MoveResult {
+        self.step_internal(direction, None)
+    }
+
+    pub fn step_with_forced_next(&mut self, direction: Direction, forced_rank: u16) -> MoveResult {
+        self.step_internal(direction, Some(forced_rank))
+    }
+
+    fn step_internal(&mut self, direction: Direction, forced_rank: Option<u16>) -> MoveResult {
         self.attempted_moves += 1;
 
         let before = self.board;
@@ -301,7 +325,27 @@ impl Game {
 
         self.board = slide.board;
         let preview = self.next_tile.clone();
-        let rank = self.draw.consume_next(&preview, &mut self.rng);
+        let rank = match forced_rank {
+            Some(forced_rank) => {
+                let consumed_rank = match &preview {
+                    NextTile::Basic { rank, .. } => {
+                        debug_assert_eq!(*rank, forced_rank);
+                        *rank
+                    }
+                    NextTile::Bonus { ranks, .. } => {
+                        if ranks.contains(&forced_rank) {
+                            forced_rank
+                        } else {
+                            ranks[0]
+                        }
+                    }
+                };
+                self.draw
+                    .consume_known_rank(&preview, consumed_rank, &mut self.rng);
+                consumed_rank
+            }
+            None => self.draw.consume_next(&preview, &mut self.rng),
+        };
         self.bonus_tracker.advance_after_consuming_current();
         let spawn_idx = self.choose_spawn_index(&slide.board, direction, slide.moved_lines);
         let (row, col) = (spawn_idx / SIZE, spawn_idx % SIZE);
@@ -535,18 +579,16 @@ impl DrawState {
         }
     }
 
-    fn consume_known_rank<R: Rng + ?Sized>(&mut self, next: &NextTile, rank: u16, rng: &mut R) {
+    fn consume_known_rank<R: Rng + ?Sized>(&mut self, next: &NextTile, _rank: u16, rng: &mut R) {
         match next {
-            NextTile::Basic { rank: expected, .. } => {
+            NextTile::Basic { .. } => {
                 let drawn = self.draw_basic(rng);
-                debug_assert_eq!(*expected, drawn);
-                debug_assert_eq!(rank, drawn);
                 if self.pending_bonus_cycle_active {
                     self.advance_bonus_cycle(rng);
                 }
+                debug_assert!(matches!(drawn, 1 | 2 | 3));
             }
             NextTile::Bonus { ranks, .. } => {
-                debug_assert!(ranks.contains(&rank));
                 self.advance_bonus_cycle(rng);
                 let _ = rng.gen_range(0..ranks.len());
             }
@@ -816,5 +858,62 @@ mod tests {
             serde_json::to_value(before).unwrap(),
             serde_json::to_value(after).unwrap()
         );
+    }
+
+    #[test]
+    fn preview_outcomes_respect_deterministic_next_tile_probability() {
+        let mut game = Game::new(123);
+        let direction = game
+            .legal_directions()
+            .into_iter()
+            .next()
+            .expect("game should have at least one legal move");
+        game.force_next_tile(NextTile::Basic { rank: 3, face: 3 });
+        let outcomes = game.preview_outcomes(direction);
+        assert!(!outcomes.is_empty());
+
+        let expected = 1.0 / outcomes.len() as f64;
+        for outcome in outcomes {
+            assert!((outcome.probability - expected).abs() < f64::EPSILON);
+            assert!(outcome.row < SIZE);
+            assert!(outcome.col < SIZE);
+            assert_eq!(outcome.face, 3);
+        }
+    }
+
+    #[test]
+    fn preview_outcomes_keep_bonus_ranking_probability() {
+        let mut game = Game::new(123);
+        let direction = game
+            .legal_directions()
+            .into_iter()
+            .next()
+            .expect("game should have at least one legal move");
+        game.force_next_tile(NextTile::Bonus {
+            ranks: vec![4, 5],
+            faces: vec![6, 12],
+        });
+        let outcomes = game.preview_outcomes(direction);
+        assert!(!outcomes.is_empty());
+
+        let mut has_rank_4 = false;
+        let mut has_rank_5 = false;
+        let mut total_probability = 0.0;
+        let expected = 1.0 / outcomes.len() as f64;
+
+        for outcome in outcomes {
+            total_probability += outcome.probability;
+            assert!(
+                outcome.face == 6 || outcome.face == 12,
+                "unexpected bonus rank in preview outcome"
+            );
+            has_rank_4 = has_rank_4 || outcome.face == 6;
+            has_rank_5 = has_rank_5 || outcome.face == 12;
+        }
+
+        assert!(has_rank_4);
+        assert!(has_rank_5);
+        assert!((total_probability - 1.0).abs() < 1e-9);
+        assert!(expected > 0.0);
     }
 }

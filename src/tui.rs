@@ -10,11 +10,13 @@ use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use std::io::{stdout, IsTerminal, Stdout, Write};
 use std::path::PathBuf;
+use std::thread::sleep;
 use std::time::Duration;
 
 const TILE_WIDTH: usize = 8;
 const TILE_HEIGHT: usize = 4;
 const TILE_LABEL_ROW: usize = 1;
+const BOARD_GUTTER: usize = 4;
 const NL: &str = "\r\n";
 
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +43,7 @@ pub struct HumanConfig {
     pub log_text: Option<PathBuf>,
     pub color: ColorMode,
     pub speed_hz: f64,
+    pub bot_opponent: Option<BotKind>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +73,77 @@ impl ObserverConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BotOpponentState {
+    last_move: Option<LastMoveView>,
+    active: bool,
+}
+
+fn step_bot_opponent_turn(
+    bot: &mut dyn Bot,
+    opponent_game: &mut Game,
+    opponent_state: &mut BotOpponentState,
+    visible_next: Option<&NextTile>,
+    forced_rank: Option<u16>,
+    mirror_human_next: bool,
+) -> bool {
+    if !opponent_state.active || opponent_game.is_game_over() {
+        opponent_state.active = false;
+        return false;
+    }
+
+    if let Some(visible_next) = visible_next {
+        opponent_game.force_next_tile(visible_next.clone());
+    }
+    match bot.choose_move(opponent_game) {
+        Some(bot_direction) => {
+            let opponent_result = match forced_rank {
+                Some(rank) => opponent_game.step_with_forced_next(bot_direction, rank),
+                None => opponent_game.step(bot_direction),
+            };
+            opponent_state.last_move = opponent_result.spawn.as_ref().map(|spawn| LastMoveView {
+                direction: bot_direction,
+                tile_face: spawn.face,
+            });
+            opponent_state.active = !opponent_result.game_over;
+            if mirror_human_next {
+                if let Some(visible_next) = visible_next {
+                    opponent_game.force_next_tile(visible_next.clone());
+                }
+            }
+        }
+        None => {
+            opponent_state.active = false;
+            opponent_state.last_move = None;
+        }
+    }
+
+    opponent_state.active && !opponent_game.is_game_over()
+}
+
+fn redraw_human_state(
+    stdout: &mut Stdout,
+    game: &Game,
+    last_move: Option<&LastMoveView>,
+    use_color: bool,
+    message: &str,
+    opponent: Option<(&Game, Option<&LastMoveView>, Option<&NextTile>)>,
+) -> Result<()> {
+    match opponent {
+        Some((bot_game, bot_last_move, bot_next)) => draw_dual_game(
+            stdout,
+            game,
+            bot_game,
+            last_move,
+            bot_last_move,
+            bot_next,
+            use_color,
+            message,
+        ),
+        None => draw_game(stdout, game, last_move, use_color, message),
+    }
+}
+
 pub fn run_human(config: HumanConfig) -> Result<()> {
     let mut stdout = stdout();
     let use_color = match config.color {
@@ -81,6 +155,16 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
     let mut logger = GameLogger::new(config.log_json.clone(), config.log_text.clone())?;
     let mut seed = next_seed(config.seed);
     let mut game = Game::new(seed);
+    let mut bot_opponent = config.bot_opponent.map(|kind| {
+        (
+            create_bot(kind, seed),
+            Game::new(seed),
+            BotOpponentState {
+                last_move: None,
+                active: true,
+            },
+        )
+    });
     let log_config = RunConfigLog {
         mode: "human".to_string(),
         seed_source: if config.seed.is_some() {
@@ -96,12 +180,21 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
     let _guard = TerminalGuard::activate(&mut stdout)?;
     logger.log_start(&game.snapshot(), &log_config)?;
     let mut last_move = None;
-    draw_game(
+    redraw_human_state(
         &mut stdout,
         &game,
         last_move.as_ref(),
         use_color,
         "arrows, wasd/hjkl to move; q quit; r restart",
+        bot_opponent
+            .as_ref()
+            .map(|(_, opponent_game, opponent_state)| {
+                (
+                    opponent_game,
+                    opponent_state.last_move.as_ref(),
+                    Some(opponent_game.next_tile()),
+                )
+            }),
     )?;
 
     loop {
@@ -115,25 +208,88 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                         tile_face: spawn.face,
                     });
                 }
-                if result.game_over {
-                    draw_game(
-                        &mut stdout,
-                        &game,
-                        last_move.as_ref(),
-                        use_color,
-                        &game_over_message(&game),
-                    )?;
-                    logger.log_end("game_over", &game.snapshot())?;
-                    wait_for_key()?;
-                    break;
+
+                if result.accepted {
+                    let forced_rank = result.spawn.as_ref().map_or_else(
+                        || game.next_tile().single_rank().unwrap_or(3),
+                        |spawn| spawn.rank,
+                    );
+                    if let Some((bot, opponent_game, opponent_state)) = bot_opponent.as_mut() {
+                        step_bot_opponent_turn(
+                            bot.as_mut(),
+                            opponent_game,
+                            opponent_state,
+                            Some(game.next_tile()),
+                            Some(forced_rank),
+                            true,
+                        );
+                    }
                 }
-                draw_game(
+
+                let redraw_message = if result.game_over {
+                    game_over_message(&game)
+                } else {
+                    "arrows, wasd/hjkl to move; q quit; r restart".to_string()
+                };
+                redraw_human_state(
                     &mut stdout,
                     &game,
                     last_move.as_ref(),
                     use_color,
-                    "arrows, wasd/hjkl to move; q quit; r restart",
+                    &redraw_message,
+                    bot_opponent
+                        .as_ref()
+                        .map(|(_, opponent_game, opponent_state)| {
+                            (
+                                opponent_game,
+                                opponent_state.last_move.as_ref(),
+                                Some(opponent_game.next_tile()),
+                            )
+                        }),
                 )?;
+
+                if result.game_over {
+                    if let Some((bot, opponent_game, opponent_state)) = bot_opponent.as_mut() {
+                        while step_bot_opponent_turn(
+                            bot.as_mut(),
+                            opponent_game,
+                            opponent_state,
+                            None,
+                            None,
+                            false,
+                        ) {
+                            redraw_human_state(
+                                &mut stdout,
+                                &game,
+                                last_move.as_ref(),
+                                use_color,
+                                "human finished, bot continues",
+                                Some((
+                                    opponent_game,
+                                    opponent_state.last_move.as_ref(),
+                                    Some(opponent_game.next_tile()),
+                                )),
+                            )?;
+                            sleep(Duration::from_secs_f64(1.0 / config.speed_hz));
+                        }
+
+                        redraw_human_state(
+                            &mut stdout,
+                            &game,
+                            last_move.as_ref(),
+                            use_color,
+                            &redraw_message,
+                            Some((
+                                opponent_game,
+                                opponent_state.last_move.as_ref(),
+                                Some(opponent_game.next_tile()),
+                            )),
+                        )?;
+                    }
+                    logger.log_end("game_over", &game.snapshot())?;
+                    wait_for_key()?;
+                    break;
+                }
             }
             Action::Quit => {
                 if confirm(
@@ -142,16 +298,34 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     "Quit? y/n",
+                    bot_opponent
+                        .as_ref()
+                        .map(|(_, opponent_game, opponent_state)| {
+                            (
+                                opponent_game,
+                                opponent_state.last_move.as_ref(),
+                                Some(opponent_game.next_tile()),
+                            )
+                        }),
                 )? {
                     logger.log_end("quit", &game.snapshot())?;
                     break;
                 }
-                draw_game(
+                redraw_human_state(
                     &mut stdout,
                     &game,
                     last_move.as_ref(),
                     use_color,
                     "arrows, wasd/hjkl to move; q quit; r restart",
+                    bot_opponent
+                        .as_ref()
+                        .map(|(_, opponent_game, opponent_state)| {
+                            (
+                                opponent_game,
+                                opponent_state.last_move.as_ref(),
+                                Some(opponent_game.next_tile()),
+                            )
+                        }),
                 )?;
             }
             Action::Restart => {
@@ -161,19 +335,47 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move.as_ref(),
                     use_color,
                     "Restart? y/n",
+                    bot_opponent
+                        .as_ref()
+                        .map(|(_, opponent_game, opponent_state)| {
+                            (
+                                opponent_game,
+                                opponent_state.last_move.as_ref(),
+                                Some(opponent_game.next_tile()),
+                            )
+                        }),
                 )? {
                     logger.log_end("restart", &game.snapshot())?;
                     seed = next_seed(config.seed);
                     game = Game::new(seed);
+                    bot_opponent = config.bot_opponent.map(|kind| {
+                        (
+                            create_bot(kind, seed),
+                            Game::new(seed),
+                            BotOpponentState {
+                                last_move: None,
+                                active: true,
+                            },
+                        )
+                    });
                     last_move = None;
                     logger.log_start(&game.snapshot(), &log_config)?;
                 }
-                draw_game(
+                redraw_human_state(
                     &mut stdout,
                     &game,
                     last_move.as_ref(),
                     use_color,
                     "arrows, wasd/hjkl to move; q quit; r restart",
+                    bot_opponent
+                        .as_ref()
+                        .map(|(_, opponent_game, opponent_state)| {
+                            (
+                                opponent_game,
+                                opponent_state.last_move.as_ref(),
+                                Some(opponent_game.next_tile()),
+                            )
+                        }),
                 )?;
             }
             Action::Terminate => {
@@ -443,8 +645,9 @@ fn confirm(
     last_move: Option<&LastMoveView>,
     use_color: bool,
     message: &str,
+    opponent: Option<(&Game, Option<&LastMoveView>, Option<&NextTile>)>,
 ) -> Result<bool> {
-    draw_game(stdout, game, last_move, use_color, message)?;
+    redraw_human_state(stdout, game, last_move, use_color, message, opponent)?;
     loop {
         let event = event::read().context("failed to read terminal input")?;
         let Event::Key(key) = event else {
@@ -508,6 +711,96 @@ fn draw_game(
     Ok(())
 }
 
+fn draw_dual_game(
+    stdout: &mut Stdout,
+    human_game: &Game,
+    bot_game: &Game,
+    human_last_move: Option<&LastMoveView>,
+    bot_last_move: Option<&LastMoveView>,
+    bot_next: Option<&NextTile>,
+    use_color: bool,
+    message: &str,
+) -> Result<()> {
+    const BOARD_WIDTH: usize = TILE_WIDTH * SIZE;
+    const GUTTER: usize = BOARD_GUTTER;
+
+    let human_score = format!("you {:>6} pts", human_game.score());
+    let bot_score = format!("bot {:>6} pts", bot_game.score());
+    let human_meta = format!(
+        "seed {}  moves {}  high {}  next {}",
+        human_game.seed(),
+        human_game.accepted_moves(),
+        human_game.high_tile(),
+        human_game.next_tile().display_label()
+    );
+    let bot_meta = format!(
+        "seed {}  moves {}  high {}  next {}",
+        bot_game.seed(),
+        bot_game.accepted_moves(),
+        bot_game.high_tile(),
+        bot_next
+            .map(|next| next.display_label())
+            .unwrap_or_else(|| bot_game.next_tile().display_label())
+    );
+    let human_prev = human_last_move
+        .map(last_move_label)
+        .unwrap_or_else(|| "previous -".to_string());
+    let bot_prev = bot_last_move
+        .map(last_move_label)
+        .unwrap_or_else(|| "previous -".to_string());
+
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    queue!(
+        stdout,
+        Print(format!(
+            "{:<width$}{:<gap$}{:<width$}{}",
+            human_score,
+            "",
+            bot_score,
+            NL,
+            width = BOARD_WIDTH,
+            gap = GUTTER
+        )),
+        Print(format!(
+            "{:<width$}{:<gap$}{:<width$}{}",
+            human_meta,
+            "",
+            bot_meta,
+            NL,
+            width = BOARD_WIDTH,
+            gap = GUTTER
+        )),
+        Print(format!(
+            "{:<width$}{:<gap$}{:<width$}{}",
+            human_prev,
+            "",
+            bot_prev,
+            NL,
+            width = BOARD_WIDTH,
+            gap = GUTTER
+        ))
+    )?;
+
+    let human_board = human_game.board();
+    let bot_board = bot_game.board();
+    for row in 0..SIZE {
+        for tile_row in 0..TILE_HEIGHT {
+            draw_tile_row_dual(stdout, &human_board, &bot_board, row, tile_row, use_color)?;
+        }
+    }
+
+    queue!(stdout, Print(NL))?;
+    draw_next_pair(
+        stdout,
+        human_game.next_tile(),
+        bot_next.unwrap_or_else(|| bot_game.next_tile()),
+        use_color,
+    )?;
+    queue!(stdout, Print(format!("{}{}", message, NL)))?;
+    stdout.flush()?;
+    Ok(())
+}
+
 fn draw_tile_row(
     stdout: &mut Stdout,
     board: &Board,
@@ -528,16 +821,79 @@ fn draw_tile_row(
     Ok(())
 }
 
+fn draw_tile_row_dual(
+    stdout: &mut Stdout,
+    human: &Board,
+    bot: &Board,
+    row: usize,
+    tile_row: usize,
+    use_color: bool,
+) -> Result<()> {
+    for col in 0..SIZE {
+        let rank = human.get(row, col);
+        let label = if tile_row == TILE_LABEL_ROW {
+            tile_label(rank)
+        } else {
+            " ".repeat(TILE_WIDTH)
+        };
+        draw_tile(stdout, rank, &label, use_color)?;
+    }
+
+    queue!(stdout, Print(" ".repeat(BOARD_GUTTER)))?;
+    for col in 0..SIZE {
+        let rank = bot.get(row, col);
+        let label = if tile_row == TILE_LABEL_ROW {
+            tile_label(rank)
+        } else {
+            " ".repeat(TILE_WIDTH)
+        };
+        draw_tile(stdout, rank, &label, use_color)?;
+    }
+    queue!(stdout, Print(NL))?;
+    Ok(())
+}
+
 fn draw_next_tile(stdout: &mut Stdout, next: &NextTile, use_color: bool) -> Result<()> {
     queue!(stdout, Print("next "))?;
+    draw_next_value(stdout, next, use_color)
+}
+
+fn draw_next_pair(
+    stdout: &mut Stdout,
+    human_next: &NextTile,
+    bot_next: &NextTile,
+    use_color: bool,
+) -> Result<()> {
+    let board_width = TILE_WIDTH * SIZE;
+    let human_prefix = "you next ";
+    let bot_prefix = "bot next ";
+    let pad_between = board_width.saturating_sub(human_prefix.len() + TILE_WIDTH) + BOARD_GUTTER;
+
+    queue!(stdout, Print(human_prefix))?;
+    draw_next_value(stdout, human_next, use_color)?;
+    queue!(stdout, Print(" ".repeat(pad_between)))?;
+    queue!(stdout, Print(bot_prefix))?;
+    draw_next_value(stdout, bot_next, use_color)?;
+    queue!(stdout, Print(NL))?;
+    Ok(())
+}
+
+fn draw_next_value(stdout: &mut Stdout, next: &NextTile, use_color: bool) -> Result<()> {
+    if let Some(rank) = next.single_rank() {
+        draw_tile(
+            stdout,
+            rank,
+            &center_label(&rank_to_face(rank).to_string()),
+            use_color,
+        )?;
+        return Ok(());
+    }
+
     match next {
-        NextTile::Basic { rank, face } => {
-            draw_tile(stdout, *rank, &center_label(&face.to_string()), use_color)?;
-        }
         NextTile::Bonus { .. } => {
-            let label = "+";
-            draw_tile(stdout, 3, &center_label(label), use_color)?;
+            draw_tile(stdout, 3, &center_label("+"), use_color)?;
         }
+        _ => unreachable!("unexpected next tile variant"),
     }
     Ok(())
 }
@@ -652,6 +1008,24 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot::Bot;
+
+    struct StaticBot(Direction);
+
+    impl Bot for StaticBot {
+        fn name(&self) -> &'static str {
+            "static"
+        }
+
+        fn choose_move(&mut self, game: &Game) -> Option<Direction> {
+            let legal = game.legal_directions();
+            if legal.contains(&self.0) {
+                Some(self.0)
+            } else {
+                None
+            }
+        }
+    }
 
     #[test]
     fn observer_speed_maps_to_delay() {
@@ -735,5 +1109,31 @@ mod tests {
         };
 
         assert_eq!(bonus_forecast_label(&forecast), "+1 5.0%");
+    }
+
+    #[test]
+    fn step_bot_turn_without_mirroring_updates_opponent_next() {
+        let mut opponent_game = Game::new(123);
+        let legal = opponent_game.legal_directions();
+        let Some(direction) = legal.first().copied() else {
+            panic!("game should have a legal move in test fixture");
+        };
+
+        let mut expected = opponent_game.clone();
+        expected.step(direction);
+
+        let mut state = BotOpponentState {
+            last_move: None,
+            active: true,
+        };
+        let mut bot = StaticBot(direction);
+        step_bot_opponent_turn(&mut bot, &mut opponent_game, &mut state, None, None, false);
+
+        assert_eq!(
+            opponent_game.next_tile().display_label(),
+            expected.next_tile().display_label()
+        );
+        assert_eq!(opponent_game.score(), expected.score());
+        assert_eq!(opponent_game.board(), expected.board());
     }
 }
