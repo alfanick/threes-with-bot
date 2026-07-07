@@ -1,7 +1,20 @@
 [package]
 name = "threes"
 version = "0.1.0"
+description = "Terminal Threes clone with human play, bot opponent support, and alpha-beta bot evaluation"
+license = "MIT"
+readme = "README.md"
 edition = "2021"
+rust-version = "1.80"
+authors = ["Threes Contributors"]
+keywords = ["game", "threes", "terminal", "cli", "ai"]
+categories = ["games", "command-line-utilities"]
+exclude = [
+    "/target",
+    "/.github",
+    "/.idea",
+    "/.vscode",
+]
 
 [dependencies]
 anyhow = "1.0"
