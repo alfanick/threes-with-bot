@@ -32,6 +32,24 @@ impl BotKind {
 pub trait Bot {
     fn name(&self) -> &'static str;
     fn choose_move(&mut self, game: &Game) -> Option<Direction>;
+    fn search_stats(&self) -> Option<AbSearchStats> {
+        None
+    }
+
+    fn board_eval(&self, _game: &Game) -> Option<f64> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AbSearchStats {
+    pub predicted_states: u64,
+    pub pruned_states: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub searched_depth: u8,
+    pub selected_score: f64,
+    pub board_eval: f64,
 }
 
 pub fn create_bot(kind: BotKind, game_seed: u64) -> Box<dyn Bot> {
@@ -102,6 +120,7 @@ impl Bot for RandomBot {
 struct AbBot {
     config: AbConfig,
     cache: RwLock<HashMap<AbCacheKey, AbCacheEntry>>,
+    last_stats: Option<AbSearchStats>,
 }
 
 impl AbBot {
@@ -109,30 +128,39 @@ impl AbBot {
         Self {
             config,
             cache: RwLock::new(HashMap::new()),
+            last_stats: None,
         }
     }
 
-    fn choose_with_score(&self, game: &Game) -> Option<(Direction, f64)> {
+    fn choose_with_score(&self, game: &Game) -> Option<(Direction, f64, AbSearchStats)> {
         let legal = game.legal_directions();
         if legal.is_empty() {
             return None;
         }
 
         let ordered_directions = self.order_directions(game, legal);
+        let board_eval = evaluate(game, self.config);
 
-        if self.config.has_limits() {
-            self.choose_with_limited_budget(game, &ordered_directions)
+        let mut result = if self.config.has_limits() {
+            self.choose_with_limited_budget(game, &ordered_directions, board_eval)
         } else {
-            self.choose_with_fixed_depth_par(game, &ordered_directions)
+            self.choose_with_fixed_depth_par(game, &ordered_directions, board_eval)
+        };
+
+        if let Some((_, _, stats)) = &mut result {
+            stats.board_eval = board_eval;
         }
+
+        result
     }
 
     fn choose_with_fixed_depth_par(
         &self,
         game: &Game,
         ordered_directions: &[Direction],
-    ) -> Option<(Direction, f64)> {
-        ordered_directions
+        board_eval: f64,
+    ) -> Option<(Direction, f64, AbSearchStats)> {
+        let results: Vec<(usize, Direction, f64, SearchStats)> = ordered_directions
             .iter()
             .copied()
             .enumerate()
@@ -148,21 +176,59 @@ impl AbBot {
                     self.config.beta,
                     &mut budget,
                 );
-                (index, direction, value)
+                (index, direction, value, budget.stats())
             })
-            .reduce_with(best_parallel_result)
-            .map(|(_, direction, value)| (direction, value))
+            .collect();
+
+        let mut best: Option<(usize, Direction, f64)> = None;
+        let mut aggregate = SearchStats::default();
+
+        for (index, direction, value, stats) in results {
+            aggregate.add(stats);
+            if best.is_none() {
+                best = Some((index, direction, value));
+                continue;
+            }
+            let best_score = best.map(|(_, _, score)| score).unwrap_or(f64::NEG_INFINITY);
+            if value > best_score
+                || (value == best_score
+                    && index
+                        < best
+                            .map(|(best_index, _, _)| best_index)
+                            .unwrap_or(usize::MAX))
+            {
+                best = Some((index, direction, value));
+            }
+        }
+
+        best.map(|(_, direction, score)| {
+            (
+                direction,
+                score,
+                AbSearchStats {
+                    predicted_states: aggregate.predicted_states,
+                    pruned_states: aggregate.pruned_states,
+                    cache_hits: aggregate.cache_hits,
+                    cache_misses: aggregate.cache_misses,
+                    searched_depth: self.config.depth,
+                    selected_score: score,
+                    board_eval,
+                },
+            )
+        })
     }
 
     fn choose_with_limited_budget(
         &self,
         game: &Game,
         ordered_directions: &[Direction],
-    ) -> Option<(Direction, f64)> {
+        board_eval: f64,
+    ) -> Option<(Direction, f64, AbSearchStats)> {
         let mut budget = SearchBudget::new(self.config.search_time_limit(), self.config.node_limit);
 
         let mut best: Option<(Direction, f64)> = None;
         let mut alpha = self.config.alpha;
+        let mut searched_depth = 0;
 
         for depth in 1..=self.config.depth {
             if !budget.can_continue() {
@@ -179,20 +245,42 @@ impl AbBot {
             ) {
                 best = Some((direction, score));
                 alpha = alpha.max(score);
+                searched_depth = depth;
                 if alpha >= self.config.beta {
                     break;
                 }
             }
         }
 
-        if best.is_none() {
-            best = ordered_directions
-                .first()
-                .copied()
-                .map(|direction| (direction, evaluate(game, self.config)));
-        }
-
-        best
+        best.map(|(direction, score)| {
+            let stats = budget.stats();
+            (
+                direction,
+                score,
+                AbSearchStats {
+                    predicted_states: stats.predicted_states,
+                    pruned_states: stats.pruned_states,
+                    cache_hits: stats.cache_hits,
+                    cache_misses: stats.cache_misses,
+                    searched_depth,
+                    selected_score: score,
+                    board_eval,
+                },
+            )
+        })
+        .or_else(|| {
+            let fallback = ordered_directions.first().copied()?;
+            Some((
+                fallback,
+                board_eval,
+                AbSearchStats {
+                    selected_score: board_eval,
+                    board_eval,
+                    searched_depth: 0,
+                    ..AbSearchStats::default()
+                },
+            ))
+        })
     }
 
     fn choose_with_depth_and_budget(
@@ -291,7 +379,7 @@ impl AbBot {
         let key = AbCacheKey::new(game, depth, self.config.dfs);
         let original_alpha = alpha;
 
-        if let Some(entry) = self.cached_entry(&key) {
+        if let Some(entry) = self.cached_entry(&key, budget) {
             match entry.bound {
                 AbCacheBound::Exact => return entry.value,
                 AbCacheBound::Lower => {
@@ -303,6 +391,7 @@ impl AbBot {
             }
 
             if alpha >= beta {
+                budget.record_prune();
                 return entry.value;
             }
         }
@@ -339,6 +428,7 @@ impl AbBot {
             best = best.max(value);
             alpha = alpha.max(best);
             if alpha >= beta {
+                budget.record_prune();
                 cut_off = true;
                 break;
             }
@@ -402,12 +492,19 @@ impl AbBot {
             .sum()
     }
 
-    fn cached_entry(&self, key: &AbCacheKey) -> Option<AbCacheEntry> {
-        self.cache
+    fn cached_entry(&self, key: &AbCacheKey, budget: &mut SearchBudget) -> Option<AbCacheEntry> {
+        let found = self
+            .cache
             .read()
             .expect("AB cache lock poisoned")
             .get(key)
-            .cloned()
+            .cloned();
+        if found.is_some() {
+            budget.record_cache_hit();
+        } else {
+            budget.record_cache_miss();
+        }
+        found
     }
 
     fn store_cached_value(&self, key: AbCacheKey, value: f64, bound: AbCacheBound) {
@@ -478,6 +575,9 @@ struct SearchBudget {
     deadline: Option<Instant>,
     node_limit: Option<u64>,
     nodes: u64,
+    pruned_states: u64,
+    cache_hits: u64,
+    cache_misses: u64,
 }
 
 impl SearchBudget {
@@ -487,6 +587,9 @@ impl SearchBudget {
             deadline,
             node_limit,
             nodes: 0,
+            pruned_states: 0,
+            cache_hits: 0,
+            cache_misses: 0,
         }
     }
 
@@ -495,6 +598,9 @@ impl SearchBudget {
             deadline: None,
             node_limit: None,
             nodes: 0,
+            pruned_states: 0,
+            cache_hits: 0,
+            cache_misses: 0,
         }
     }
 
@@ -517,17 +623,43 @@ impl SearchBudget {
     fn record_node(&mut self) {
         self.nodes += 1;
     }
+
+    fn record_prune(&mut self) {
+        self.pruned_states += 1;
+    }
+
+    fn record_cache_hit(&mut self) {
+        self.cache_hits += 1;
+    }
+
+    fn record_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+
+    fn stats(&self) -> SearchStats {
+        SearchStats {
+            predicted_states: self.nodes,
+            pruned_states: self.pruned_states,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+        }
+    }
 }
 
-fn best_parallel_result(
-    left: (usize, Direction, f64),
-    right: (usize, Direction, f64),
-) -> (usize, Direction, f64) {
-    let left_is_better = left.2 > right.2 || (left.2 == right.2 && left.0 < right.0);
-    if left_is_better {
-        left
-    } else {
-        right
+#[derive(Clone, Copy, Debug, Default)]
+struct SearchStats {
+    predicted_states: u64,
+    pruned_states: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+}
+
+impl SearchStats {
+    fn add(&mut self, other: Self) {
+        self.predicted_states += other.predicted_states;
+        self.pruned_states += other.pruned_states;
+        self.cache_hits += other.cache_hits;
+        self.cache_misses += other.cache_misses;
     }
 }
 
@@ -537,7 +669,17 @@ impl Bot for AbBot {
     }
 
     fn choose_move(&mut self, game: &Game) -> Option<Direction> {
-        self.choose_with_score(game).map(|(direction, _)| direction)
+        let (direction, _, stats) = self.choose_with_score(game)?;
+        self.last_stats = Some(stats);
+        Some(direction)
+    }
+
+    fn search_stats(&self) -> Option<AbSearchStats> {
+        self.last_stats
+    }
+
+    fn board_eval(&self, game: &Game) -> Option<f64> {
+        Some(evaluate(game, self.config))
     }
 }
 
@@ -958,10 +1100,19 @@ mod tests {
     }
 
     #[test]
-    fn parallel_result_tie_breaks_by_move_order() {
-        let left = (2, Direction::Left, 10.0);
-        let right = (1, Direction::Right, 10.0);
-        assert_eq!(best_parallel_result(left, right), right);
+    fn ab_bot_reports_search_stats_after_move() {
+        let game = Game::new(123);
+        let mut bot = create_bot(BotKind::Ab(AbConfig::default()), 123);
+        bot.choose_move(&game).unwrap();
+
+        let Some(stats) = bot.search_stats() else {
+            panic!("ab bot should expose search stats");
+        };
+
+        assert!(stats.searched_depth >= 1);
+        assert!(stats.predicted_states > 0);
+        assert!(stats.board_eval >= 0.0);
+        assert!(stats.selected_score.is_finite());
     }
 
     #[test]

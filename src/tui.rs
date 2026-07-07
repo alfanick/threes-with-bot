@@ -1,5 +1,5 @@
 use crate::board::{rank_to_face, Board, Direction, SIZE};
-use crate::bot::{create_bot, AbConfig, BotKind};
+use crate::bot::{create_bot, AbConfig, Bot, BotKind};
 use crate::game::{time_seed, BonusForecast, Game, NextTile, DEFAULT_BONUS_FORECAST_HORIZON};
 use crate::logging::{AbConfigLog, GameLogger, RunConfigLog};
 use anyhow::{Context, Result};
@@ -223,7 +223,7 @@ pub fn run_observed_bot(config: BotConfig) -> Result<()> {
         &game,
         last_move.as_ref(),
         use_color,
-        &bot_status(bot.name(), config.speed_hz),
+        &bot_status(bot.as_ref(), config.speed_hz, &game),
     )?;
 
     loop {
@@ -244,7 +244,7 @@ pub fn run_observed_bot(config: BotConfig) -> Result<()> {
                     &game,
                     last_move.as_ref(),
                     use_color,
-                    &bot_status(bot.name(), config.speed_hz),
+                    &bot_status(bot.as_ref(), config.speed_hz, &game),
                 )?;
                 continue;
             }
@@ -293,7 +293,7 @@ pub fn run_observed_bot(config: BotConfig) -> Result<()> {
             &game,
             last_move.as_ref(),
             use_color,
-            &bot_status(bot.name(), config.speed_hz),
+            &bot_status(bot.as_ref(), config.speed_hz, &game),
         )?;
     }
 
@@ -374,8 +374,36 @@ fn game_over_message(game: &Game) -> String {
     )
 }
 
-fn bot_status(bot_name: &str, speed_hz: f64) -> String {
-    format!("bot {bot_name} running at {speed_hz} Hz; q quit; r restart")
+fn bot_status(bot: &dyn Bot, speed_hz: f64, game: &Game) -> String {
+    let mut status = format!("bot {} running at {speed_hz} Hz", bot.name());
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(eval) = bot.board_eval(game) {
+        parts.push(format!("eval {eval:.1}"));
+    }
+
+    if let Some(stats) = bot.search_stats() {
+        let pruned_after = stats.predicted_states.saturating_sub(stats.pruned_states);
+        parts.push(format!("d {}", stats.searched_depth));
+        parts.push(format!(
+            "pred {} ({} pruned)",
+            pruned_after, stats.pruned_states
+        ));
+        parts.push(format!(
+            "cache {}h/{}m",
+            stats.cache_hits, stats.cache_misses
+        ));
+        parts.push(format!("best {:.1}", stats.selected_score));
+    }
+
+    if !parts.is_empty() {
+        status.push_str(" [");
+        status.push_str(&parts.join(", "));
+        status.push(']');
+    }
+
+    status.push_str("; q quit; r restart");
+    status
 }
 
 fn ab_log_config(bot: BotKind) -> Option<AbConfigLog> {
@@ -652,9 +680,23 @@ mod tests {
 
     #[test]
     fn bot_status_mentions_bot_and_speed() {
-        let status = bot_status("random", 4.0);
+        let bot = create_bot(BotKind::Random, 123);
+        let game = Game::new(123);
+        let status = bot_status(bot.as_ref(), 4.0, &game);
         assert!(status.contains("random"));
         assert!(status.contains("4"));
+    }
+
+    #[test]
+    fn bot_status_includes_ab_stats_after_move() {
+        let mut bot = create_bot(BotKind::Ab(AbConfig::default()), 123);
+        let game = Game::new(123);
+        bot.choose_move(&game);
+
+        let status = bot_status(bot.as_ref(), 4.0, &game);
+        assert!(status.contains("pred"));
+        assert!(status.contains("cache"));
+        assert!(status.contains("best"));
     }
 
     #[test]
