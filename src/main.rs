@@ -56,6 +56,22 @@ struct Cli {
     )]
     ab_depth: u8,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "MS",
+        help = "Time limit per --bot ab move in milliseconds"
+    )]
+    ab_time_limit_ms: Option<u64>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "COUNT",
+        help = "Node budget per --bot ab move"
+    )]
+    ab_node_limit: Option<u64>,
+
     #[arg(long, global = true, default_value = "-inf", value_parser = parse_finite_or_infinite, help = "Initial alpha bound for --bot ab")]
     ab_alpha: f64,
 
@@ -144,11 +160,26 @@ fn ab_config(cli: &Cli) -> Result<AbConfig> {
     if cli.ab_alpha >= cli.ab_beta {
         bail!("--ab-alpha must be less than --ab-beta");
     }
+
+    if let Some(ms) = cli.ab_time_limit_ms {
+        if ms == 0 {
+            bail!("--ab-time-limit-ms must be greater than 0");
+        }
+    }
+
+    if let Some(nodes) = cli.ab_node_limit {
+        if nodes == 0 {
+            bail!("--ab-node-limit must be greater than 0");
+        }
+    }
+
     Ok(AbConfig {
         depth: cli.ab_depth,
         alpha: cli.ab_alpha,
         beta: cli.ab_beta,
         dfs: cli.ab_dfs,
+        time_limit_ms: cli.ab_time_limit_ms,
+        node_limit: cli.ab_node_limit,
     })
 }
 

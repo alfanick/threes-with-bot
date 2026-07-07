@@ -1,11 +1,12 @@
 use crate::board::{rank_to_face, Board, Direction, SIZE};
-use crate::game::{Game, DEFAULT_BONUS_FORECAST_HORIZON};
+use crate::game::{Game, Outcome, DEFAULT_BONUS_FORECAST_HORIZON};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 const BOT_SEED_DOMAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 const DFS_PLAN_DEPTH: u8 = 4;
@@ -46,6 +47,8 @@ pub struct AbConfig {
     pub alpha: f64,
     pub beta: f64,
     pub dfs: bool,
+    pub time_limit_ms: Option<u64>,
+    pub node_limit: Option<u64>,
 }
 
 impl Default for AbConfig {
@@ -55,7 +58,21 @@ impl Default for AbConfig {
             alpha: f64::NEG_INFINITY,
             beta: f64::INFINITY,
             dfs: false,
+            time_limit_ms: None,
+            node_limit: None,
         }
+    }
+}
+
+impl AbConfig {
+    fn search_time_limit(&self) -> Option<Duration> {
+        self.time_limit_ms
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
+
+    fn has_limits(&self) -> bool {
+        self.time_limit_ms.is_some() || self.node_limit.is_some()
     }
 }
 
@@ -84,7 +101,7 @@ impl Bot for RandomBot {
 
 struct AbBot {
     config: AbConfig,
-    cache: RwLock<HashMap<AbCacheKey, f64>>,
+    cache: RwLock<HashMap<AbCacheKey, AbCacheEntry>>,
 }
 
 impl AbBot {
@@ -96,21 +113,119 @@ impl AbBot {
     }
 
     fn choose_with_score(&self, game: &Game) -> Option<(Direction, f64)> {
-        game.legal_directions()
-            .into_par_iter()
+        let legal = game.legal_directions();
+        if legal.is_empty() {
+            return None;
+        }
+
+        let ordered_directions = self.order_directions(game, legal);
+
+        if self.config.has_limits() {
+            self.choose_with_limited_budget(game, &ordered_directions)
+        } else {
+            self.choose_with_fixed_depth_par(game, &ordered_directions)
+        }
+    }
+
+    fn choose_with_fixed_depth_par(
+        &self,
+        game: &Game,
+        ordered_directions: &[Direction],
+    ) -> Option<(Direction, f64)> {
+        ordered_directions
+            .iter()
+            .copied()
             .enumerate()
+            .collect::<Vec<_>>()
+            .into_par_iter()
             .map(|(index, direction)| {
+                let mut budget = SearchBudget::unlimited();
                 let value = self.expected_value_for_move(
                     game,
                     direction,
                     self.config.depth,
                     self.config.alpha,
                     self.config.beta,
+                    &mut budget,
                 );
                 (index, direction, value)
             })
             .reduce_with(best_parallel_result)
             .map(|(_, direction, value)| (direction, value))
+    }
+
+    fn choose_with_limited_budget(
+        &self,
+        game: &Game,
+        ordered_directions: &[Direction],
+    ) -> Option<(Direction, f64)> {
+        let mut budget = SearchBudget::new(self.config.search_time_limit(), self.config.node_limit);
+
+        let mut best: Option<(Direction, f64)> = None;
+        let mut alpha = self.config.alpha;
+
+        for depth in 1..=self.config.depth {
+            if !budget.can_continue() {
+                break;
+            }
+
+            if let Some((direction, score)) = self.choose_with_depth_and_budget(
+                game,
+                ordered_directions,
+                depth,
+                alpha,
+                self.config.beta,
+                &mut budget,
+            ) {
+                best = Some((direction, score));
+                alpha = alpha.max(score);
+                if alpha >= self.config.beta {
+                    break;
+                }
+            }
+        }
+
+        if best.is_none() {
+            best = ordered_directions
+                .first()
+                .copied()
+                .map(|direction| (direction, evaluate(game, self.config)));
+        }
+
+        best
+    }
+
+    fn choose_with_depth_and_budget(
+        &self,
+        game: &Game,
+        ordered_directions: &[Direction],
+        depth: u8,
+        mut alpha: f64,
+        beta: f64,
+        budget: &mut SearchBudget,
+    ) -> Option<(Direction, f64)> {
+        let mut best_direction = None;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for direction in ordered_directions.iter().copied() {
+            if !budget.can_continue() {
+                break;
+            }
+
+            let value = self.expected_value_for_move(game, direction, depth, alpha, beta, budget);
+
+            if value > best_score || (value == best_score && best_direction.is_none()) {
+                best_score = value;
+                best_direction = Some(direction);
+            }
+
+            alpha = alpha.max(best_score);
+            if alpha >= beta {
+                break;
+            }
+        }
+
+        best_direction.map(|direction| (direction, best_score))
     }
 
     fn expected_value_for_move(
@@ -120,47 +235,107 @@ impl AbBot {
         depth: u8,
         alpha: f64,
         beta: f64,
+        budget: &mut SearchBudget,
     ) -> f64 {
         let outcomes = game.preview_outcomes(direction);
         if outcomes.is_empty() {
             return f64::NEG_INFINITY;
         }
 
+        self.expected_value_for_move_with_outcomes(&outcomes, depth, alpha, beta, budget)
+    }
+
+    fn expected_value_for_move_with_outcomes(
+        &self,
+        outcomes: &[Outcome],
+        depth: u8,
+        alpha: f64,
+        beta: f64,
+        budget: &mut SearchBudget,
+    ) -> f64 {
         let mut expected = 0.0;
         for outcome in outcomes {
+            if !budget.can_continue() {
+                return evaluate(outcome.game(), self.config);
+            }
+
             let value = if depth <= 1 || outcome.game().is_game_over() {
                 evaluate(outcome.game(), self.config)
             } else {
-                self.search(outcome.game(), depth - 1, alpha, beta)
+                self.search_with_budget(outcome.game(), depth - 1, alpha, beta, budget)
             };
             expected += outcome.probability * value;
         }
         expected
     }
 
-    fn search(&self, game: &Game, depth: u8, mut alpha: f64, beta: f64) -> f64 {
+    #[cfg(test)]
+    fn search(&self, game: &Game, depth: u8, alpha: f64, beta: f64) -> f64 {
+        let mut budget = SearchBudget::unlimited();
+        self.search_with_budget(game, depth, alpha, beta, &mut budget)
+    }
+
+    fn search_with_budget(
+        &self,
+        game: &Game,
+        depth: u8,
+        mut alpha: f64,
+        mut beta: f64,
+        budget: &mut SearchBudget,
+    ) -> f64 {
+        if !budget.can_continue() {
+            return evaluate(game, self.config);
+        }
+
+        budget.record_node();
         let key = AbCacheKey::new(game, depth, self.config.dfs);
-        if let Some(value) = self.cached_value(&key) {
-            return value;
+        let original_alpha = alpha;
+
+        if let Some(entry) = self.cached_entry(&key) {
+            match entry.bound {
+                AbCacheBound::Exact => return entry.value,
+                AbCacheBound::Lower => {
+                    alpha = alpha.max(entry.value);
+                }
+                AbCacheBound::Upper => {
+                    beta = beta.min(entry.value);
+                }
+            }
+
+            if alpha >= beta {
+                return entry.value;
+            }
         }
 
         if depth == 0 || game.is_game_over() {
             let value = evaluate(game, self.config);
-            self.store_cached_value(key, value);
+            self.store_cached_value(key, value, AbCacheBound::Exact);
             return value;
         }
 
         let legal = game.legal_directions();
         if legal.is_empty() {
             let value = evaluate(game, self.config);
-            self.store_cached_value(key, value);
+            self.store_cached_value(key, value, AbCacheBound::Exact);
             return value;
         }
 
+        let candidates = self.ordered_move_candidates(game, legal);
+
         let mut best = f64::NEG_INFINITY;
         let mut cut_off = false;
-        for direction in legal {
-            let value = self.expected_value_for_move(game, direction, depth, alpha, beta);
+        for candidate in candidates {
+            if !budget.can_continue() {
+                return evaluate(game, self.config);
+            }
+
+            let value = self.expected_value_for_move_with_outcomes(
+                &candidate.outcomes,
+                depth,
+                alpha,
+                beta,
+                budget,
+            );
             best = best.max(value);
             alpha = alpha.max(best);
             if alpha >= beta {
@@ -168,26 +343,79 @@ impl AbBot {
                 break;
             }
         }
+
         if !cut_off {
-            self.store_cached_value(key, best);
+            self.store_cached_value(key, best, AbCacheBound::Exact);
+            return best;
         }
+
+        let bound = if best <= original_alpha {
+            AbCacheBound::Upper
+        } else {
+            AbCacheBound::Lower
+        };
+        self.store_cached_value(key, best, bound);
         best
     }
 
-    fn cached_value(&self, key: &AbCacheKey) -> Option<f64> {
+    fn ordered_move_candidates(&self, game: &Game, legal: Vec<Direction>) -> Vec<MoveCandidate> {
+        let mut candidates: Vec<MoveCandidate> = legal
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, direction)| {
+                let outcomes = game.preview_outcomes(direction);
+                if outcomes.is_empty() {
+                    return None;
+                }
+                let score = self.quick_outcome_value(&outcomes);
+
+                Some(MoveCandidate {
+                    direction,
+                    outcomes,
+                    score,
+                    index,
+                })
+            })
+            .collect();
+
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+
+        candidates
+    }
+
+    fn order_directions(&self, game: &Game, legal: Vec<Direction>) -> Vec<Direction> {
+        self.ordered_move_candidates(game, legal)
+            .into_iter()
+            .map(|candidate| candidate.direction)
+            .collect()
+    }
+
+    fn quick_outcome_value(&self, outcomes: &[Outcome]) -> f64 {
+        outcomes
+            .iter()
+            .map(|outcome| outcome.probability * evaluate(outcome.game(), self.config))
+            .sum()
+    }
+
+    fn cached_entry(&self, key: &AbCacheKey) -> Option<AbCacheEntry> {
         self.cache
             .read()
             .expect("AB cache lock poisoned")
             .get(key)
-            .copied()
+            .cloned()
     }
 
-    fn store_cached_value(&self, key: AbCacheKey, value: f64) {
+    fn store_cached_value(&self, key: AbCacheKey, value: f64, bound: AbCacheBound) {
         let mut cache = self.cache.write().expect("AB cache lock poisoned");
         if cache.len() >= AB_CACHE_MAX_ENTRIES {
             cache.clear();
         }
-        cache.insert(key, value);
+        cache.insert(key, AbCacheEntry { value, bound });
     }
 
     #[cfg(test)]
@@ -199,7 +427,8 @@ impl AbBot {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AbCacheKey {
     board: [u16; 16],
-    next: Vec<u16>,
+    next: [u16; 3],
+    next_len: u8,
     bonus: [u8; 3],
     depth: u8,
     dfs: bool,
@@ -207,13 +436,86 @@ struct AbCacheKey {
 
 impl AbCacheKey {
     fn new(game: &Game, depth: u8, dfs: bool) -> Self {
+        let next_signature = game.next_tile().rank_signature();
+        let mut next = [0; 3];
+        let next_len = next_signature.len().min(3);
+        next[..next_len].copy_from_slice(&next_signature[..next_len]);
+
         Self {
             board: game.board().ranks(),
-            next: game.next_tile().rank_signature(),
+            next,
+            next_len: u8::try_from(next_len).unwrap_or(3),
             bonus: game.bonus_forecast_signature(),
             depth,
             dfs,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AbCacheBound {
+    Exact,
+    Lower,
+    Upper,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AbCacheEntry {
+    value: f64,
+    bound: AbCacheBound,
+}
+
+#[derive(Clone)]
+struct MoveCandidate {
+    direction: Direction,
+    outcomes: Vec<Outcome>,
+    score: f64,
+    index: usize,
+}
+
+#[derive(Debug)]
+struct SearchBudget {
+    deadline: Option<Instant>,
+    node_limit: Option<u64>,
+    nodes: u64,
+}
+
+impl SearchBudget {
+    fn new(deadline: Option<Duration>, node_limit: Option<u64>) -> Self {
+        let deadline = deadline.map(|duration| Instant::now() + duration);
+        Self {
+            deadline,
+            node_limit,
+            nodes: 0,
+        }
+    }
+
+    fn unlimited() -> Self {
+        Self {
+            deadline: None,
+            node_limit: None,
+            nodes: 0,
+        }
+    }
+
+    fn can_continue(&self) -> bool {
+        if let Some(limit) = self.node_limit {
+            if self.nodes >= limit {
+                return false;
+            }
+        }
+
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn record_node(&mut self) {
+        self.nodes += 1;
     }
 }
 

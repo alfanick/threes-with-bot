@@ -386,11 +386,15 @@ fn ab_log_config(bot: BotKind) -> Option<AbConfigLog> {
             alpha,
             beta,
             dfs,
+            time_limit_ms,
+            node_limit,
         }) => Some(AbConfigLog {
             depth,
             alpha: log_bound(alpha),
             beta: log_bound(beta),
             dfs,
+            time_limit_ms,
+            node_limit,
         }),
     }
 }

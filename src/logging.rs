@@ -23,6 +23,8 @@ pub struct AbConfigLog {
     pub alpha: String,
     pub beta: String,
     pub dfs: bool,
+    pub time_limit_ms: Option<u64>,
+    pub node_limit: Option<u64>,
 }
 
 pub struct GameLogger {
@@ -91,8 +93,8 @@ impl GameLogger {
             if let Some(ab) = &config.ab {
                 writeln!(
                     text,
-                    "ab depth={} alpha={} beta={}",
-                    ab.depth, ab.alpha, ab.beta
+                    "ab depth={} alpha={} beta={} time_limit_ms={:?} node_limit={:?}",
+                    ab.depth, ab.alpha, ab.beta, ab.time_limit_ms, ab.node_limit
                 )?;
                 writeln!(text, "ab dfs={}", ab.dfs)?;
             }
