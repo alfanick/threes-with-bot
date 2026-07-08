@@ -47,7 +47,7 @@ pub trait Bot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AbSearchStats {
     pub predicted_states: u64,
     pub pruned_states: u64,
@@ -56,6 +56,7 @@ pub struct AbSearchStats {
     pub searched_depth: u8,
     pub selected_score: f64,
     pub board_eval: f64,
+    pub states_per_layer: Vec<u64>,
 }
 
 pub fn create_bot(kind: BotKind, game_seed: u64) -> Box<dyn Bot> {
@@ -175,7 +176,8 @@ impl AbBot {
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|(index, direction)| {
-                let mut budget = SearchBudget::unlimited_with_cancel(self.cancel.clone());
+                let mut budget =
+                    SearchBudget::unlimited_with_cancel(self.cancel.clone(), self.config.depth);
                 let value = self.expected_value_for_move(
                     game,
                     direction,
@@ -221,6 +223,7 @@ impl AbBot {
                     searched_depth: self.config.depth,
                     selected_score: score,
                     board_eval,
+                    states_per_layer: aggregate.states_per_layer,
                 },
             )
         })
@@ -236,6 +239,7 @@ impl AbBot {
             self.config.search_time_limit(),
             self.config.node_limit,
             self.cancel.clone(),
+            self.config.depth,
         );
 
         let mut best: Option<(Direction, f64)> = None;
@@ -246,6 +250,7 @@ impl AbBot {
             if !budget.can_continue() {
                 break;
             }
+            budget.set_max_depth(depth);
 
             if let Some((direction, score)) = self.choose_with_depth_and_budget(
                 game,
@@ -277,6 +282,7 @@ impl AbBot {
                     searched_depth,
                     selected_score: score,
                     board_eval,
+                    states_per_layer: stats.states_per_layer,
                 },
             )
         })
@@ -289,6 +295,7 @@ impl AbBot {
                     selected_score: board_eval,
                     board_eval,
                     searched_depth: 0,
+                    states_per_layer: Vec::new(),
                     ..AbSearchStats::default()
                 },
             ))
@@ -341,7 +348,6 @@ impl AbBot {
         if outcomes.is_empty() {
             return f64::NEG_INFINITY;
         }
-
         self.expected_value_for_move_with_outcomes(&outcomes, depth, alpha, beta, budget)
     }
 
@@ -353,6 +359,7 @@ impl AbBot {
         beta: f64,
         budget: &mut SearchBudget,
     ) -> f64 {
+        budget.record_layer_outcomes(depth, outcomes.len() as u64);
         let mut expected = 0.0;
         for outcome in outcomes {
             if !budget.can_continue() {
@@ -371,7 +378,7 @@ impl AbBot {
 
     #[cfg(test)]
     fn search(&self, game: &Game, depth: u8, alpha: f64, beta: f64) -> f64 {
-        let mut budget = SearchBudget::unlimited_with_cancel(self.cancel.clone());
+        let mut budget = SearchBudget::unlimited_with_cancel(self.cancel.clone(), depth);
         self.search_with_budget(game, depth, alpha, beta, &mut budget)
     }
 
@@ -591,18 +598,21 @@ struct SearchBudget {
     pruned_states: u64,
     cache_hits: u64,
     cache_misses: u64,
+    max_depth: u8,
+    states_per_layer: Vec<u64>,
 }
 
 impl SearchBudget {
     #[allow(dead_code)]
     fn new(deadline: Option<Duration>, node_limit: Option<u64>) -> Self {
-        Self::with_cancel(deadline, node_limit, None)
+        Self::with_cancel(deadline, node_limit, None, 0)
     }
 
     fn with_cancel(
         deadline: Option<Duration>,
         node_limit: Option<u64>,
         cancel: Option<Arc<AtomicBool>>,
+        max_depth: u8,
     ) -> Self {
         let deadline = deadline.map(|duration| Instant::now() + duration);
         Self {
@@ -613,6 +623,8 @@ impl SearchBudget {
             pruned_states: 0,
             cache_hits: 0,
             cache_misses: 0,
+            max_depth,
+            states_per_layer: Vec::new(),
         }
     }
 
@@ -621,8 +633,8 @@ impl SearchBudget {
         Self::new(None, None)
     }
 
-    fn unlimited_with_cancel(cancel: Option<Arc<AtomicBool>>) -> Self {
-        Self::with_cancel(None, None, cancel)
+    fn unlimited_with_cancel(cancel: Option<Arc<AtomicBool>>, max_depth: u8) -> Self {
+        Self::with_cancel(None, None, cancel, max_depth)
     }
 
     fn can_continue(&self) -> bool {
@@ -663,22 +675,43 @@ impl SearchBudget {
         self.cache_misses += 1;
     }
 
+    fn set_max_depth(&mut self, max_depth: u8) {
+        self.max_depth = max_depth;
+    }
+
+    fn record_layer_outcomes(&mut self, depth: u8, state_count: u64) {
+        if self.max_depth == 0 || self.max_depth < depth {
+            return;
+        }
+
+        let depth_index = (self.max_depth - depth) as usize;
+        if depth_index >= self.states_per_layer.len() {
+            self.states_per_layer.resize(depth_index + 1, 0);
+        }
+        self.states_per_layer[depth_index] =
+            self.states_per_layer[depth_index].saturating_add(state_count);
+    }
+
     fn stats(&self) -> SearchStats {
         SearchStats {
             predicted_states: self.nodes,
             pruned_states: self.pruned_states,
             cache_hits: self.cache_hits,
             cache_misses: self.cache_misses,
+            max_depth: self.max_depth,
+            states_per_layer: self.states_per_layer.clone(),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SearchStats {
     predicted_states: u64,
     pruned_states: u64,
     cache_hits: u64,
     cache_misses: u64,
+    max_depth: u8,
+    states_per_layer: Vec<u64>,
 }
 
 impl SearchStats {
@@ -687,6 +720,14 @@ impl SearchStats {
         self.pruned_states += other.pruned_states;
         self.cache_hits += other.cache_hits;
         self.cache_misses += other.cache_misses;
+        self.max_depth = self.max_depth.max(other.max_depth);
+        if self.states_per_layer.len() < other.states_per_layer.len() {
+            self.states_per_layer
+                .resize(other.states_per_layer.len(), 0);
+        }
+        for (idx, count) in other.states_per_layer.into_iter().enumerate() {
+            self.states_per_layer[idx] = self.states_per_layer[idx].saturating_add(count);
+        }
     }
 }
 
@@ -702,7 +743,7 @@ impl Bot for AbBot {
     }
 
     fn search_stats(&self) -> Option<AbSearchStats> {
-        self.last_stats
+        self.last_stats.clone()
     }
 
     fn board_eval(&self, game: &Game) -> Option<f64> {

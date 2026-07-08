@@ -82,16 +82,18 @@ impl ObserverConfig {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BotOpponentState {
     last_move: Option<LastMoveView>,
     active: bool,
+    last_status: Option<String>,
 }
 
 struct BotOpponent {
     game: Game,
     state: BotOpponentState,
     thinker: OpponentThinker,
+    bot_name: &'static str,
 }
 
 struct OpponentThinker {
@@ -104,12 +106,17 @@ struct OpponentThinkRequest {
     game: Game,
     time_limit_ms: Option<u64>,
     cancel: Arc<AtomicBool>,
-    response: mpsc::Sender<Option<Direction>>,
+    response: mpsc::Sender<OpponentThinkResponse>,
+}
+
+struct OpponentThinkResponse {
+    direction: Option<Direction>,
+    search_stats: Option<crate::bot::AbSearchStats>,
 }
 
 struct PendingThought {
     cancel: Arc<AtomicBool>,
-    response: mpsc::Receiver<Option<Direction>>,
+    response: mpsc::Receiver<OpponentThinkResponse>,
 }
 
 impl OpponentThinker {
@@ -166,15 +173,15 @@ impl OpponentThinker {
         }
     }
 
-    fn cancel_and_take_move(&mut self) -> Option<Direction> {
+    fn cancel_and_take_response(&mut self) -> Option<OpponentThinkResponse> {
         let pending = self.pending.take()?;
         pending.cancel.store(true, Ordering::SeqCst);
-        pending.response.recv().ok().flatten()
+        pending.response.recv().ok()
     }
 
-    fn take_move(&mut self) -> Option<Direction> {
+    fn take_move(&mut self) -> Option<OpponentThinkResponse> {
         let pending = self.pending.take()?;
-        pending.response.recv().ok().flatten()
+        pending.response.recv().ok()
     }
 }
 
@@ -198,7 +205,11 @@ fn opponent_think_worker(
         bot.set_cancel_token(Some(request.cancel));
         bot.set_time_limit_ms(request.time_limit_ms);
         let direction = bot.choose_move(&request.game);
-        let _ = request.response.send(direction);
+        let search_stats = bot.search_stats();
+        let _ = request.response.send(OpponentThinkResponse {
+            direction,
+            search_stats,
+        });
     }
 }
 
@@ -253,16 +264,22 @@ fn redraw_human_state(
     last_move: Option<&LastMoveView>,
     use_color: bool,
     message: &str,
-    opponent: Option<(&Game, Option<&LastMoveView>, Option<&NextTile>)>,
+    opponent: Option<(
+        &Game,
+        Option<&LastMoveView>,
+        Option<&NextTile>,
+        Option<&str>,
+    )>,
 ) -> Result<()> {
     match opponent {
-        Some((bot_game, bot_last_move, bot_next)) => draw_dual_game(
+        Some((bot_game, bot_last_move, bot_next, bot_status)) => draw_dual_game(
             stdout,
             game,
             bot_game,
             last_move,
             bot_last_move,
             bot_next,
+            bot_status,
             use_color,
             message,
         ),
@@ -280,12 +297,18 @@ fn human_move_budget_ms(elapsed: Duration) -> u64 {
 
 fn opponent_view(
     opponent: &Option<BotOpponent>,
-) -> Option<(&Game, Option<&LastMoveView>, Option<&NextTile>)> {
+) -> Option<(
+    &Game,
+    Option<&LastMoveView>,
+    Option<&NextTile>,
+    Option<&str>,
+)> {
     opponent.as_ref().map(|opponent| {
         (
             &opponent.game,
             opponent.state.last_move.as_ref(),
             Some(opponent.game.next_tile()),
+            opponent.state.last_status.as_deref(),
         )
     })
 }
@@ -306,8 +329,10 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
         state: BotOpponentState {
             last_move: None,
             active: true,
+            last_status: None,
         },
         thinker: OpponentThinker::new(kind, seed),
+        bot_name: kind.name(),
     });
     let log_config = RunConfigLog {
         mode: "human".to_string(),
@@ -365,7 +390,11 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                         |spawn| spawn.rank,
                     );
                     if let Some(opponent) = bot_opponent.as_mut() {
-                        let direction = opponent.thinker.cancel_and_take_move();
+                        let response = opponent.thinker.cancel_and_take_response();
+                        opponent.state.last_status = response.as_ref().and_then(|resp| {
+                            format_opponent_status(opponent.bot_name, resp.search_stats.clone())
+                        });
+                        let direction = response.and_then(|resp| resp.direction);
                         step_bot_opponent_turn(
                             &mut opponent.game,
                             &mut opponent.state,
@@ -407,7 +436,11 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                                 &opponent.game,
                                 Some(human_budget_ms),
                             );
-                            let direction = opponent.thinker.take_move();
+                            let response = opponent.thinker.take_move();
+                            opponent.state.last_status = response.as_ref().and_then(|resp| {
+                                format_opponent_status(opponent.bot_name, resp.search_stats.clone())
+                            });
+                            let direction = response.and_then(|resp| resp.direction);
                             step_bot_opponent_turn(
                                 &mut opponent.game,
                                 &mut opponent.state,
@@ -428,6 +461,7 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                                         &opponent.game,
                                         opponent.state.last_move.as_ref(),
                                         Some(bot_next),
+                                        opponent.state.last_status.as_deref(),
                                     )),
                                 )?;
                                 sleep(Duration::from_secs_f64(1.0 / config.speed_hz));
@@ -445,6 +479,7 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                                 &opponent.game,
                                 opponent.state.last_move.as_ref(),
                                 Some(bot_next),
+                                opponent.state.last_status.as_deref(),
                             )),
                         )?;
                     }
@@ -492,8 +527,10 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                         state: BotOpponentState {
                             last_move: None,
                             active: true,
+                            last_status: None,
                         },
                         thinker: OpponentThinker::new(kind, seed),
+                        bot_name: kind.name(),
                     });
                     if let Some(opponent) = bot_opponent.as_mut() {
                         opponent
@@ -732,6 +769,9 @@ fn bot_status(bot: &dyn Bot, speed_hz: f64, game: &Game) -> String {
             stats.cache_hits, stats.cache_misses
         ));
         parts.push(format!("best {:.1}", stats.selected_score));
+        if let Some(layer_summary) = format_state_layers(&stats) {
+            parts.push(layer_summary);
+        }
     }
 
     if !parts.is_empty() {
@@ -742,6 +782,74 @@ fn bot_status(bot: &dyn Bot, speed_hz: f64, game: &Game) -> String {
 
     status.push_str("; q quit; r restart");
     status
+}
+
+fn format_opponent_status(
+    name: &'static str,
+    stats: Option<crate::bot::AbSearchStats>,
+) -> Option<String> {
+    let stats = stats?;
+    let mut status = format!("bot {name}");
+    let mut parts: Vec<String> = Vec::new();
+
+    let eval = stats.board_eval;
+    parts.push(format!("eval {eval:.1}"));
+
+    let pruned_after = stats.predicted_states.saturating_sub(stats.pruned_states);
+    parts.push(format!("d {}", stats.searched_depth));
+    parts.push(format!(
+        "pred {} ({} pruned)",
+        pruned_after, stats.pruned_states
+    ));
+    parts.push(format!(
+        "cache {}h/{}m",
+        stats.cache_hits, stats.cache_misses
+    ));
+    parts.push(format!("best {:.1}", stats.selected_score));
+    if let Some(layer_summary) = format_state_layers(&stats) {
+        parts.push(layer_summary);
+    }
+
+    if !parts.is_empty() {
+        status.push_str(" [");
+        status.push_str(&parts.join(", "));
+        status.push(']');
+    }
+
+    Some(status)
+}
+
+fn format_state_layers(stats: &crate::bot::AbSearchStats) -> Option<String> {
+    if stats.states_per_layer.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let max_depth = stats.searched_depth.max(stats.states_per_layer.len() as u8);
+    for layer in 0..usize::from(max_depth) {
+        if layer >= stats.states_per_layer.len() {
+            break;
+        }
+        if layer == 0 {
+            let exact = stats.states_per_layer[0];
+            parts.push(format!("{}", exact));
+        } else if layer < stats.states_per_layer.len() {
+            let parent = stats.states_per_layer[layer - 1];
+            let current = stats.states_per_layer[layer];
+            let avg = if parent == 0 {
+                0
+            } else {
+                ((current as f64 / parent as f64).ceil()) as u64
+            };
+            parts.push(format!("{}", avg));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 fn ab_log_config(bot: BotKind) -> Option<AbConfigLog> {
@@ -781,7 +889,12 @@ fn confirm(
     last_move: Option<&LastMoveView>,
     use_color: bool,
     message: &str,
-    opponent: Option<(&Game, Option<&LastMoveView>, Option<&NextTile>)>,
+    opponent: Option<(
+        &Game,
+        Option<&LastMoveView>,
+        Option<&NextTile>,
+        Option<&str>,
+    )>,
 ) -> Result<bool> {
     redraw_human_state(stdout, game, last_move, use_color, message, opponent)?;
     loop {
@@ -862,6 +975,7 @@ fn draw_dual_game(
     human_last_move: Option<&LastMoveView>,
     bot_last_move: Option<&LastMoveView>,
     bot_next: Option<&NextTile>,
+    bot_status: Option<&str>,
     use_color: bool,
     message: &str,
 ) -> Result<()> {
@@ -951,7 +1065,12 @@ fn draw_dual_game(
         bot_next.unwrap_or_else(|| bot_game.next_tile()),
         use_color,
     )?;
-    queue!(stdout, Print(format!("{}{}", message, NL)))?;
+    let footer = if let Some(bot_status) = bot_status {
+        format!("{}  |  {}{}", message, bot_status, NL)
+    } else {
+        format!("{}{}", message, NL)
+    };
+    queue!(stdout, Print(footer))?;
     stdout.flush()?;
     Ok(())
 }
@@ -1092,7 +1211,8 @@ fn draw_tile(
 
     match (first_non_space, last_non_space) {
         (Some(start), Some(end)) if end >= start => {
-            let (start_offset, end_offset) = (chars[start].0, chars[end].0 + chars[end].1.len_utf8());
+            let (start_offset, end_offset) =
+                (chars[start].0, chars[end].0 + chars[end].1.len_utf8());
             let head = &label[..start_offset];
             let body = &label[start_offset..end_offset];
             let tail = &label[end_offset..];
@@ -1270,6 +1390,8 @@ mod tests {
         assert!(status.contains("pred"));
         assert!(status.contains("cache"));
         assert!(status.contains("best"));
+        assert!(status.contains(";"));
+        assert!(status.contains("/"));
     }
 
     #[test]
@@ -1326,6 +1448,7 @@ mod tests {
         let mut state = BotOpponentState {
             last_move: None,
             active: true,
+            last_status: None,
         };
         let mut bot = StaticBot(direction);
         let direction = bot.choose_move(&opponent_game);
