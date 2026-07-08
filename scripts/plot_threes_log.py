@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,12 +111,21 @@ def plot(
     state_ax.set_ylabel("states per layer")
 
     max_layers = max((len(v) for v in layer_values), default=0)
+    layer_color = "#9467bd"
+    min_layer_alpha = 0.25
+    layer_alphas: list[float] = []
     for layer in range(max_layers):
+        if max_layers <= 1:
+            alpha = 1.0
+        else:
+            alpha = 1.0 - (layer / (max_layers - 1)) * (1.0 - min_layer_alpha)
+        layer_alphas.append(alpha)
         state_ax.plot(
             steps,
             pad_layer(layer_values, layer),
             label=f"layer {layer}",
-            alpha=0.85,
+            color=layer_color,
+            alpha=alpha,
             linewidth=0.9,
         )
 
@@ -127,6 +137,15 @@ def plot(
         loc="upper left",
         fontsize="small",
     )
+    legend = score_ax.get_legend()
+    if legend is not None:
+        text_labels = legend.get_texts()
+        for idx, text in enumerate(text_labels):
+            layer_index = idx - len(lines)
+            if layer_index < 0:
+                continue
+            if 0 <= layer_index < len(layer_alphas):
+                text.set_color(mcolors.to_rgba(layer_color, alpha=layer_alphas[layer_index]))
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
