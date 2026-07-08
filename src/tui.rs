@@ -1,7 +1,7 @@
 use crate::board::{rank_to_face, Board, Direction, SIZE};
 use crate::bot::{create_bot, AbConfig, Bot, BotKind};
 use crate::game::{time_seed, BonusForecast, Game, NextTile, DEFAULT_BONUS_FORECAST_HORIZON};
-use crate::logging::{AbConfigLog, GameLogger, RunConfigLog};
+use crate::logging::{AbConfigLog, AbTurnStats, GameLogger, RunConfigLog};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -373,7 +373,32 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                 let elapsed = turn_started.elapsed();
                 let human_budget_ms = human_move_budget_ms(elapsed);
                 let result = game.step(direction);
-                logger.log_turn(&result)?;
+                let mut bot_search = None;
+                if let Some(opponent) = bot_opponent.as_mut() {
+                    if result.accepted {
+                        let response = opponent.thinker.cancel_and_take_response();
+                        opponent.state.last_status = response.as_ref().and_then(|resp| {
+                            format_opponent_status(opponent.bot_name, resp.search_stats.clone())
+                        });
+                        bot_search = response.as_ref().and_then(|resp| {
+                            resp.search_stats.as_ref().map(AbTurnStats::from_bot_stats)
+                        });
+                        let direction = response.and_then(|resp| resp.direction);
+                        let forced_rank = result.spawn.as_ref().map_or_else(
+                            || game.next_tile().single_rank().unwrap_or(3),
+                            |spawn| spawn.rank,
+                        );
+                        step_bot_opponent_turn(
+                            &mut opponent.game,
+                            &mut opponent.state,
+                            direction,
+                            Some(game.next_tile()),
+                            Some(forced_rank),
+                            true,
+                        );
+                    }
+                }
+                logger.log_turn("human", &result, bot_search)?;
                 if let Some(spawn) = result.spawn.as_ref() {
                     last_move = Some(LastMoveView {
                         direction,
@@ -385,24 +410,7 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
 
                 if result.accepted {
                     opponent_turn_time_limit_ms = Some(human_budget_ms);
-                    let forced_rank = result.spawn.as_ref().map_or_else(
-                        || game.next_tile().single_rank().unwrap_or(3),
-                        |spawn| spawn.rank,
-                    );
                     if let Some(opponent) = bot_opponent.as_mut() {
-                        let response = opponent.thinker.cancel_and_take_response();
-                        opponent.state.last_status = response.as_ref().and_then(|resp| {
-                            format_opponent_status(opponent.bot_name, resp.search_stats.clone())
-                        });
-                        let direction = response.and_then(|resp| resp.direction);
-                        step_bot_opponent_turn(
-                            &mut opponent.game,
-                            &mut opponent.state,
-                            direction,
-                            Some(game.next_tile()),
-                            Some(forced_rank),
-                            true,
-                        );
                         if opponent.state.active {
                             opponent.thinker.request_if_needed(
                                 opponent.state.active,
@@ -642,7 +650,10 @@ pub fn run_observed_bot(config: BotConfig) -> Result<()> {
         };
 
         let result = game.step(direction);
-        logger.log_turn(&result)?;
+        let stats = bot
+            .search_stats()
+            .map(|search| AbTurnStats::from_bot_stats(&search));
+        logger.log_turn("bot", &result, stats)?;
         if let Some(spawn) = result.spawn.as_ref() {
             last_move = Some(LastMoveView {
                 direction,

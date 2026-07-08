@@ -46,6 +46,17 @@ After installing:
 threes-with-bot --help
 ```
 
+### Plot machine logs
+
+```bash
+python3 scripts/plot_threes_log.py path/to/machine.log --output path/to/plot.pdf
+```
+
+The script renders:
+
+- left axis: `score` and `eval` (from bot search stats)
+- right axis: per-layer state counts from each recorded turn
+
 ## Controls
 
 - Move: arrow keys or `wasd`/`hjkl`

@@ -27,6 +27,33 @@ pub struct AbConfigLog {
     pub node_limit: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AbTurnStats {
+    pub predicted_states: u64,
+    pub pruned_states: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub searched_depth: u8,
+    pub selected_score: f64,
+    pub board_eval: f64,
+    pub states_per_layer: Vec<u64>,
+}
+
+impl AbTurnStats {
+    pub fn from_bot_stats(stats: &crate::bot::AbSearchStats) -> Self {
+        Self {
+            predicted_states: stats.predicted_states,
+            pruned_states: stats.pruned_states,
+            cache_hits: stats.cache_hits,
+            cache_misses: stats.cache_misses,
+            searched_depth: stats.searched_depth,
+            selected_score: stats.selected_score,
+            board_eval: stats.board_eval,
+            states_per_layer: stats.states_per_layer.clone(),
+        }
+    }
+}
+
 pub struct GameLogger {
     json: Option<BufWriter<File>>,
     text: Option<BufWriter<File>>,
@@ -42,7 +69,10 @@ enum JsonEvent<'a> {
     },
     Turn {
         schema_version: u8,
+        actor: &'a str,
         result: &'a MoveResult,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bot_search: Option<AbTurnStats>,
     },
     End {
         schema_version: u8,
@@ -110,10 +140,17 @@ impl GameLogger {
         Ok(())
     }
 
-    pub fn log_turn(&mut self, result: &MoveResult) -> Result<()> {
+    pub fn log_turn(
+        &mut self,
+        actor: &str,
+        result: &MoveResult,
+        bot_search: Option<AbTurnStats>,
+    ) -> Result<()> {
         self.write_json(&JsonEvent::Turn {
             schema_version: SCHEMA_VERSION,
+            actor,
             result,
+            bot_search,
         })?;
 
         if let Some(text) = &mut self.text {
@@ -255,5 +292,31 @@ mod tests {
         assert!(json.contains("\"schema_version\":1"));
         assert!(json.contains("\"seed\":1"));
         assert!(!json.contains("\"rank\""));
+    }
+
+    #[test]
+    fn serializes_turn_with_bot_search() {
+        let mut game = Game::new(1);
+        let result = game.step(game.legal_directions()[0]);
+        let stats = AbTurnStats {
+            predicted_states: 10,
+            pruned_states: 3,
+            cache_hits: 2,
+            cache_misses: 5,
+            searched_depth: 4,
+            selected_score: 123.4,
+            board_eval: 234.5,
+            states_per_layer: vec![10, 5, 4, 3],
+        };
+        let event = JsonEvent::Turn {
+            schema_version: SCHEMA_VERSION,
+            actor: "ab",
+            result: &result,
+            bot_search: Some(stats),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"actor\":\"ab\""));
+        assert!(json.contains("\"predicted_states\":10"));
+        assert!(json.contains("\"states_per_layer\":[10,5,4,3]"));
     }
 }
