@@ -51,6 +51,7 @@ pub struct SlideResult {
     pub moved_lines: [bool; SIZE],
     pub changed: bool,
     pub merged: bool,
+    pub merged_cells: [bool; CELLS],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +59,7 @@ struct LineSlide {
     line: [u16; SIZE],
     changed: bool,
     merged: bool,
+    merged_cells: [bool; SIZE],
 }
 
 impl Board {
@@ -142,6 +144,7 @@ impl Board {
         let mut moved_lines = [false; SIZE];
         let mut changed = false;
         let mut merged = false;
+        let mut merged_cells = [false; CELLS];
 
         for (line_idx, moved_line) in moved_lines.iter_mut().enumerate() {
             let line = self.line_front_to_back(direction, line_idx);
@@ -149,6 +152,12 @@ impl Board {
             if slide.changed {
                 *moved_line = true;
                 changed = true;
+            }
+            for (offset, merged_cell) in slide.merged_cells.into_iter().enumerate() {
+                if merged_cell {
+                    let idx = index_for_line(direction, line_idx, offset);
+                    merged_cells[idx] = true;
+                }
             }
             merged |= slide.merged;
             next.write_line_front_to_back(direction, line_idx, slide.line);
@@ -159,6 +168,7 @@ impl Board {
             moved_lines,
             changed,
             merged,
+            merged_cells,
         }
     }
 
@@ -244,6 +254,7 @@ fn coords_for(direction: Direction, line_idx: usize, offset: usize) -> (usize, u
 
 fn slide_line_toward_front(line: [u16; SIZE]) -> LineSlide {
     let mut moving = [false; SIZE];
+    let mut merged_cells = [false; SIZE];
 
     for idx in 1..SIZE {
         let rank = line[idx];
@@ -269,6 +280,7 @@ fn slide_line_toward_front(line: [u16; SIZE]) -> LineSlide {
             if line[target] != 0 && !moving[target] {
                 if let Some(merged_rank) = merge_rank(line[target], rank) {
                     output[target] = merged_rank;
+                    merged_cells[target] = true;
                     merged = true;
                     continue;
                 }
@@ -283,7 +295,13 @@ fn slide_line_toward_front(line: [u16; SIZE]) -> LineSlide {
         line: output,
         changed: output != line,
         merged,
+        merged_cells,
     }
+}
+
+fn index_for_line(direction: Direction, line_idx: usize, offset: usize) -> usize {
+    let (row, col) = coords_for(direction, line_idx, offset);
+    index(row, col)
 }
 
 #[cfg(test)]

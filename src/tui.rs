@@ -5,7 +5,9 @@ use crate::logging::{AbConfigLog, GameLogger, RunConfigLog};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+use crossterm::style::{
+    Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use std::io::{stdout, IsTerminal, Stdout, Write};
@@ -70,6 +72,8 @@ pub struct ObserverConfig {
 struct LastMoveView {
     direction: Direction,
     tile_face: u64,
+    spawn_idx: Option<usize>,
+    merged_cells: [bool; SIZE * SIZE],
 }
 
 impl ObserverConfig {
@@ -224,6 +228,8 @@ fn step_bot_opponent_turn(
             opponent_state.last_move = opponent_result.spawn.as_ref().map(|spawn| LastMoveView {
                 direction: bot_direction,
                 tile_face: spawn.face,
+                spawn_idx: Some(spawn.row * SIZE + spawn.col),
+                merged_cells: opponent_result.merged_cells,
             });
             opponent_state.active = !opponent_result.game_over;
             if mirror_human_next {
@@ -347,6 +353,8 @@ pub fn run_human(config: HumanConfig) -> Result<()> {
                     last_move = Some(LastMoveView {
                         direction,
                         tile_face: spawn.face,
+                        spawn_idx: Some(spawn.row * SIZE + spawn.col),
+                        merged_cells: result.merged_cells,
                     });
                 }
 
@@ -602,6 +610,8 @@ pub fn run_observed_bot(config: BotConfig) -> Result<()> {
             last_move = Some(LastMoveView {
                 direction,
                 tile_face: spawn.face,
+                spawn_idx: Some(spawn.row * SIZE + spawn.col),
+                merged_cells: result.merged_cells,
             });
         }
         if result.game_over {
@@ -826,7 +836,15 @@ fn draw_game(
     let board = game.board();
     for row in 0..SIZE {
         for tile_row in 0..TILE_HEIGHT {
-            draw_tile_row(stdout, &board, row, tile_row, use_color)?;
+            draw_tile_row(
+                stdout,
+                &board,
+                row,
+                tile_row,
+                last_move.and_then(|last| last.spawn_idx),
+                last_move.map_or(&[false; SIZE * SIZE], |last| &last.merged_cells),
+                use_color,
+            )?;
         }
     }
 
@@ -911,7 +929,18 @@ fn draw_dual_game(
     let bot_board = bot_game.board();
     for row in 0..SIZE {
         for tile_row in 0..TILE_HEIGHT {
-            draw_tile_row_dual(stdout, &human_board, &bot_board, row, tile_row, use_color)?;
+            draw_tile_row_dual(
+                stdout,
+                &human_board,
+                &bot_board,
+                row,
+                tile_row,
+                human_last_move.and_then(|last| last.spawn_idx),
+                human_last_move.map_or(&[false; SIZE * SIZE], |last| &last.merged_cells),
+                bot_last_move.and_then(|last| last.spawn_idx),
+                bot_last_move.map_or(&[false; SIZE * SIZE], |last| &last.merged_cells),
+                use_color,
+            )?;
         }
     }
 
@@ -932,16 +961,21 @@ fn draw_tile_row(
     board: &Board,
     row: usize,
     tile_row: usize,
+    spawn_idx: Option<usize>,
+    merged_cells: &[bool; SIZE * SIZE],
     use_color: bool,
 ) -> Result<()> {
     for col in 0..SIZE {
         let rank = board.get(row, col);
+        let idx = row * SIZE + col;
+        let bold = Some(idx) == spawn_idx;
+        let underline = merged_cells[idx];
         let label = if tile_row == TILE_LABEL_ROW {
             tile_label(rank)
         } else {
             " ".repeat(TILE_WIDTH)
         };
-        draw_tile(stdout, rank, &label, use_color)?;
+        draw_tile(stdout, rank, &label, bold, underline, use_color)?;
     }
     queue!(stdout, Print(NL))?;
     Ok(())
@@ -953,27 +987,37 @@ fn draw_tile_row_dual(
     bot: &Board,
     row: usize,
     tile_row: usize,
+    human_spawn_idx: Option<usize>,
+    human_merged_cells: &[bool; SIZE * SIZE],
+    bot_spawn_idx: Option<usize>,
+    bot_merged_cells: &[bool; SIZE * SIZE],
     use_color: bool,
 ) -> Result<()> {
     for col in 0..SIZE {
         let rank = human.get(row, col);
+        let idx = row * SIZE + col;
+        let bold = Some(idx) == human_spawn_idx;
+        let underline = human_merged_cells[idx];
         let label = if tile_row == TILE_LABEL_ROW {
             tile_label(rank)
         } else {
             " ".repeat(TILE_WIDTH)
         };
-        draw_tile(stdout, rank, &label, use_color)?;
+        draw_tile(stdout, rank, &label, bold, underline, use_color)?;
     }
 
     queue!(stdout, Print(" ".repeat(BOARD_GUTTER)))?;
     for col in 0..SIZE {
         let rank = bot.get(row, col);
+        let idx = row * SIZE + col;
+        let bold = Some(idx) == bot_spawn_idx;
+        let underline = bot_merged_cells[idx];
         let label = if tile_row == TILE_LABEL_ROW {
             tile_label(rank)
         } else {
             " ".repeat(TILE_WIDTH)
         };
-        draw_tile(stdout, rank, &label, use_color)?;
+        draw_tile(stdout, rank, &label, bold, underline, use_color)?;
     }
     queue!(stdout, Print(NL))?;
     Ok(())
@@ -1010,6 +1054,8 @@ fn draw_next_value(stdout: &mut Stdout, next: &NextTile, use_color: bool) -> Res
             stdout,
             rank,
             &center_label(&rank_to_face(rank).to_string()),
+            false,
+            false,
             use_color,
         )?;
         return Ok(());
@@ -1017,27 +1063,54 @@ fn draw_next_value(stdout: &mut Stdout, next: &NextTile, use_color: bool) -> Res
 
     match next {
         NextTile::Bonus { .. } => {
-            draw_tile(stdout, 3, &center_label("+"), use_color)?;
+            draw_tile(stdout, 3, &center_label("+"), false, false, use_color)?;
         }
         _ => unreachable!("unexpected next tile variant"),
     }
     Ok(())
 }
 
-fn draw_tile(stdout: &mut Stdout, rank: u16, label: &str, use_color: bool) -> Result<()> {
+fn draw_tile(
+    stdout: &mut Stdout,
+    rank: u16,
+    label: &str,
+    bold: bool,
+    underline: bool,
+    use_color: bool,
+) -> Result<()> {
     let label = fit_label(label);
+    let chars: Vec<(usize, char)> = label.char_indices().collect();
+    let first_non_space = chars.iter().position(|(_, ch)| !ch.is_whitespace());
+    let last_non_space = chars.iter().rposition(|(_, ch)| !ch.is_whitespace());
     if use_color {
         let (fg, bg) = tile_colors(rank);
-        queue!(
-            stdout,
-            SetForegroundColor(fg),
-            SetBackgroundColor(bg),
-            Print(label),
-            ResetColor
-        )?;
-    } else {
-        queue!(stdout, Print(label))?;
+        queue!(stdout, SetForegroundColor(fg), SetBackgroundColor(bg))?;
     }
+    if bold {
+        queue!(stdout, SetAttribute(Attribute::Bold))?;
+    }
+
+    match (first_non_space, last_non_space) {
+        (Some(start), Some(end)) if end >= start => {
+            let (start_offset, end_offset) = (chars[start].0, chars[end].0 + chars[end].1.len_utf8());
+            let head = &label[..start_offset];
+            let body = &label[start_offset..end_offset];
+            let tail = &label[end_offset..];
+            queue!(stdout, Print(head))?;
+            if underline {
+                queue!(stdout, SetAttribute(Attribute::Underlined))?;
+            }
+            queue!(stdout, Print(body))?;
+            if underline {
+                queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
+            }
+            if !tail.is_empty() {
+                queue!(stdout, Print(tail))?;
+            }
+        }
+        _ => queue!(stdout, Print(label))?,
+    }
+    queue!(stdout, SetAttribute(Attribute::Reset), ResetColor)?;
     Ok(())
 }
 
@@ -1212,6 +1285,8 @@ mod tests {
         let label = last_move_label(&LastMoveView {
             direction: Direction::Left,
             tile_face: 48,
+            spawn_idx: None,
+            merged_cells: [false; SIZE * SIZE],
         });
         assert_eq!(label, "previous ← 48");
     }
